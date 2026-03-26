@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>render_loc</name>
+  <version>0.1.0</version>
+  <description>
+    RenderLoc: Single-image 6DoF visual localization in LiDAR point cloud maps.
+    Renders synthetic images from PLY map, builds feature database offline,
+    then localizes query images via retrieval + matching + PnP.
+  </description>
+  <maintainer email="user@todo.com">user</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>message_filters</depend>
+  <depend>tf2_ros</depend>
+</package>

@@ -1,0 +1,69 @@
+# =============================================================================
+# RenderLoc Configuration
+# =============================================================================
+# Single-image 6DoF localization in PLY maps via render-and-match
+# =============================================================================
+
+camera:
+  fx: 1039.04598063
+  fy: 1041.49694151
+  cx: 937.04407689
+  cy: 560.82673816
+  width: 1920
+  height: 1200
+  # fx: 2256.627197
+  # fy: 2254.400635
+  # cx: 1891.352783
+  # cy: 1087.097656
+  # width: 3840
+  # height: 2160
+  depth_scale: 1000.0
+  depth_min: 0.3
+  depth_max: 15.0
+
+sampling:
+  max_floors: 1          # 단일층 강제
+  min_floor_gap: 2.5     # 2.5m 이내 peak 병합
+  max_floor_height: 5.0  # 5m 이상 무시
+  floor_band: 0.3   
+
+rendering:
+  inpaint_background: true  # 활성화
+  inpaint_radius: 3
+  ceiling_clip: true       # split-render 활성화
+  ceiling_margin: 0.5 
+  output_dir: "data/rendered/"
+  point_size: 2.0
+  rho_min: 2.0
+  render_color: true
+
+features:
+  superpoint_model: "models/superpoint_v1.pt"
+  max_keypoints: 1024
+  keypoint_threshold: 0.005
+  global_model: "models/netvlad.pt"
+  global_desc_dim: 512
+  use_gpu: true
+
+matching:
+  superglue_model: "models/superglue_indoor.pth"
+  match_threshold: 0.2
+  top_k_retrieval: 5
+  use_gpu: true
+
+pnp:
+  ransac_iterations: 1000
+  ransac_reproj_threshold: 8.0
+  min_inliers: 15
+  refine_with_ba: true
+
+icp:
+  enable: false
+  max_iterations: 30
+  max_correspondence_dist: 1.0
+  fitness_threshold: 0.3
+  use_gicp: true
+
+database:
+  db_path: "data/image_db.bin"
+  ply_map_path: ""

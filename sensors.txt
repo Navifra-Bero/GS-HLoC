@@ -1,0 +1,6 @@
+# kapture format: 1.1
+# sensor_id, name, sensor_type, [sensor_params]
+cam_0, cam_0, camera, PINHOLE, 1920, 1200, 1027.659153, 1030.215807, 966.827228, 585.037643
+cam_1, cam_1, camera, PINHOLE, 1920, 1200, 1028.487260, 1030.283620, 949.476264, 597.274302
+cam_2, cam_2, camera, PINHOLE, 1920, 1200, 1041.454577, 1044.072979, 945.363937, 610.455165
+cam_3, cam_3, camera, PINHOLE, 1920, 1200, 1039.045981, 1041.496942, 937.044077, 560.826738
