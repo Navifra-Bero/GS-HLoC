@@ -17,7 +17,7 @@ Online (로컬라이제이션):
 Batch test:
   python3 step_by_step.py --ply_map /path/to/map.ply --step test --test_dir /path/to/imgs [--gt_poses /path.json]
 """
-import argparse, os, pickle
+import argparse, os, pickle, glob
 import numpy as np
 import open3d as o3d
 import cv2
@@ -38,11 +38,11 @@ def load_config(p):
 def default_config():
     return {
         #cam_0
-        "camera": {
-            "fx": 1027.659153, "fy": 1030.215807, "cx": 966.827228, "cy": 585.037643,
-            "width": 1920, "height": 1080,
-            "depth_scale": 1000, "depth_min": 0.3, "depth_max": 20.0,
-        },
+        # "camera": {
+        #     "fx": 1027.659153, "fy": 1030.215807, "cx": 966.827228, "cy": 585.037643,
+        #     "width": 1920, "height": 1080,
+        #     "depth_scale": 1000, "depth_min": 0.3, "depth_max": 20.0,
+        # },
         # #cam_1
         # "camera": {
         #     "fx": 1028.487260, "fy": 1030.283620, "cx": 949.476264, "cy": 597.274302,
@@ -61,6 +61,12 @@ def default_config():
         #     "width": 1920, "height": 1080,
         #     "depth_scale": 1000, "depth_min": 0.3, "depth_max": 20.0,
         # },
+        #femto
+        "camera": {
+            "fx": 2256.627197, "fy": 2254.400635, "cx": 1891.352783, "cy": 1087.097656,
+            "width": 3840, "height": 2160,
+            "depth_scale": 1000, "depth_min": 0.3, "depth_max": 20.0,
+        },
         "alignment": {
             "normal_threshold": 0.8, "ransac_distance": 0.05,
             "ransac_n": 3, "ransac_iterations": 1000, "pre_flip_x": True,
@@ -72,6 +78,13 @@ def default_config():
             "distance_thresh_ratio": 0.3, "min_floor_points": 100,
             "max_floors": 1, "min_floor_gap": 2.5,
             "max_floor_height": 5.0, "floor_band": 0.3,
+            # "skeleton": 기존 1-pixel 중심선만 샘플링
+            # "corridor": 벽에서 min_wall_dist_m 이상 떨어진 전체 자유 공간 샘플링 (더 넓은 커버리지)
+            "sample_mode": "skeleton",
+            "min_wall_dist_m": 0.3,    # corridor 모드: 벽 최소 거리 (m)
+            # skeleton 보강: corridor 내부에 격자선 추가 (0=비활성)
+            # 예) 3.0 → 3m 간격 수평+수직선을 skeleton에 union → 넓은 방 커버리지 향상
+            "skel_grid_spacing_m": 0.5,
         },
         "rendering": {
             "point_size": 1.0,
@@ -337,7 +350,9 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
     pitch = np.radians(samp.get("pitch_deg", 0.0))
     mk = samp.get("morph_kernel_size", 5)
     dr = samp.get("distance_thresh_ratio", 0.3)
-
+    sample_mode = samp.get("sample_mode", "skeleton")   # "corridor" | "skeleton"
+    min_wall_dist_px = samp.get("min_wall_dist_m", 0.3) / gr  # corridor 모드 벽 최소 거리(px)
+    skel_grid_spacing_m = samp.get("skel_grid_spacing_m", 2.0)  # 0=비활성
     all_vp = []; debug_imgs = {}; vid = 0
 
     for fi, fz in enumerate(floors):
@@ -372,28 +387,52 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
         cs = gaussian_filter(corr.astype(float), sigma=3)
         cb = (cs > 0.3).astype(np.uint8)
 
+        # 시각화용 skeleton (항상 계산)
         skel = skeletonize(cb > 0).astype(np.uint8)
-        skel_px = np.argwhere(skel > 0)
-        print(f"    Skeleton: {len(skel_px)} px")
 
-        if len(skel_px) == 0:
-            pm = dm > (dmx * 0.5)
-            skel_px = np.argwhere(pm)
+        # ── skeleton 보강: corridor 내부에 격자선으로 대체 ──────────────
+        if skel_grid_spacing_m > 0:
+            step_px = max(1, int(round(skel_grid_spacing_m / gr)))
+            grid = np.zeros_like(skel)
+            for row in range(step_px // 2, ih, step_px):
+                grid[row, :] = 1
+            for col in range(step_px // 2, iw, step_px):
+                grid[:, col] = 1
+            # corridor 내부만 남김 (기존 skeleton 제거, 격자선만 사용)
+            skel = (grid & cb).astype(np.uint8)
+            print(f"    Grid lines only (spacing={skel_grid_spacing_m}m, step={step_px}px)")
 
-        if len(skel_px) == 0: print("    No positions"); continue
+        skel_px_all = np.argwhere(skel > 0)
+        print(f"    Skeleton (grid): {len(skel_px_all)} px")
+        # ── 샘플링 후보 선택 ──────────────────────────────────────────
+        if sample_mode == "corridor":
+            # 벽에서 min_wall_dist_m 이상 떨어진 전체 자유 공간 샘플링
+            cand_px = np.argwhere(dm > min_wall_dist_px)
+            print(f"    Corridor candidates: {len(cand_px)} px "
+                  f"(wall_dist>={samp.get('min_wall_dist_m',0.3):.2f}m)")
+        else:
+            # 기존 skeleton 모드
+            cand_px = skel_px_all
+            if len(cand_px) == 0:
+                cand_px = np.argwhere(dm > (dmx * 0.5))
 
-        swx = skel_px[:,1]*gr + xn
-        swy = skel_px[:,0]*gr + yn
+        if len(cand_px) == 0: print("    No positions"); continue
 
+        swx = cand_px[:,1]*gr + xn
+        swy = cand_px[:,0]*gr + yn
+
+        # Greedy spacing 샘플링 (path_spacing 간격 유지)
         sel = []
-        rem = list(range(len(skel_px)))
+        rem = list(range(len(cand_px)))
         np.random.seed(42)
         np.random.shuffle(rem)
+        sel_xy = []
         for idx in rem:
             pos = np.array([swx[idx], swy[idx]])
-            ok = all(np.linalg.norm(pos - np.array([swx[si], swy[si]])) >= ps for si in sel)
-            if ok: sel.append(idx)
-        print(f"    Sampled: {len(sel)} positions (spacing={ps}m)")
+            if all(np.linalg.norm(pos - q) >= ps for q in sel_xy):
+                sel.append(idx)
+                sel_xy.append(pos)
+        print(f"    Sampled: {len(sel)} positions (mode={sample_mode}, spacing={ps}m)")
 
         cz = fz + ch
         for si in sel:
@@ -418,7 +457,7 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
 
         debug_imgs[fi] = {
             "occupancy": occ, "closed": closed, "dist_map": dm, "corridor": cb,
-            "skeleton": skel, "selected_px": skel_px[sel] if sel else np.array([]),
+            "skeleton": skel, "selected_px": cand_px[sel] if sel else np.array([]),
             "xn": xn, "yn": yn, "gr": gr, "fz": fz,
         }
 
@@ -1318,6 +1357,167 @@ def step6_match(step5_data, config, output_dir):
 
 
 # =============================================================================
+# STEP 6a: 배치 retrieval + matching 시각화
+#   query_dir 내 모든 이미지 → 각각 step5(retrieval) + LoFTR → best match PNG
+#   결과는 output_dir/step6a_results/ 에 저장
+# =============================================================================
+def step6a_match_viz(query_dir, db, config, output_dir):
+    """
+    query_dir 내 모든 이미지에 대해:
+      1) MegaLoc/AnyLoc retrieval → top-K candidates
+      2) EfficientLoFTR matching → best candidate 선택
+      3) query + best_ref match line 이미지를 step6a_results/<query_stem>.png 로 저장
+    """
+    import sys, torch
+
+    eloftr_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "third_party", "EfficientLoFTR"))
+    if eloftr_root not in sys.path:
+        sys.path.insert(0, eloftr_root)
+    from src.loftr import LoFTR, full_default_cfg, opt_default_cfg, reparameter
+
+    print("\n" + "="*60 + "\nSTEP 6a: Batch retrieval + match viz\n" + "="*60)
+    print(f"  Query dir : {query_dir}")
+
+    fc          = config["features"]
+    dev         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    conf_thresh = float(fc.get("match_conf_thresh", 0.2))
+    max_dim     = int(fc.get("eloftr_max_dim", 840))
+    onl         = config.get("online", {})
+    top_k       = onl.get("top_k", 5)
+
+    # ── 쿼리 이미지 목록 ──────────────────────────────────────────────
+    query_files = sorted(
+        glob.glob(os.path.join(query_dir, "*.jpg")) +
+        glob.glob(os.path.join(query_dir, "*.png")) +
+        glob.glob(os.path.join(query_dir, "*.jpeg"))
+    )
+    if not query_files:
+        print(f"  ERROR: {query_dir} 에 이미지 없음"); return
+    print(f"  {len(query_files)} query images found")
+
+    # ── Retrieval 모델 로드 ───────────────────────────────────────────
+    global_desc_method = db.get("global_desc_method", "anyloc")
+    retr_model = None
+    if global_desc_method == "megaloc":
+        print("  Loading MegaLoc …")
+        retr_model = torch.hub.load("gmberton/MegaLoc", "get_trained_model")
+        retr_model.eval().to(dev)
+
+    # ── EfficientLoFTR 로드 ───────────────────────────────────────────
+    ckpt_path = fc.get("eloftr_ckpt",
+        os.path.join(eloftr_root, "weights", "ELoFTR", "weights", "eloftr_outdoor.ckpt"))
+    use_opt = fc.get("eloftr_opt", False)
+    _cfg = (opt_default_cfg if use_opt else full_default_cfg).copy()
+    matcher = LoFTR(config=_cfg)
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    matcher.load_state_dict(state["state_dict"])
+    matcher = reparameter(matcher).eval().to(dev)
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
+    print(f"  EfficientLoFTR loaded  (device={dev})")
+
+    def to_gray_tensor(rgb_img):
+        gray = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        oh, ow = gray.shape
+        h, w = oh, ow
+        if max(h, w) > max_dim:
+            s = max_dim / max(h, w)
+            gray = cv2.resize(gray, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+            h, w = gray.shape
+        sx, sy = ow / w, oh / h
+        ph = ((h+31)//32)*32; pw = ((w+31)//32)*32
+        if ph != h or pw != w:
+            pad = np.zeros((ph, pw), dtype=np.float32); pad[:h, :w] = gray; gray = pad
+        return torch.from_numpy(gray).unsqueeze(0).unsqueeze(0).to(dev), sx, sy
+
+    save_dir = os.path.join(output_dir, "step6a_results")
+    os.makedirs(save_dir, exist_ok=True)
+
+    for qi, qpath in enumerate(query_files):
+        stem = os.path.splitext(os.path.basename(qpath))[0]
+        print(f"\n  [{qi+1}/{len(query_files)}] {stem}")
+
+        query_rgb = cv2.cvtColor(cv2.imread(qpath), cv2.COLOR_BGR2RGB)
+
+        # ── Retrieval ─────────────────────────────────────────────────
+        if global_desc_method == "megaloc":
+            q_gd = _extract_megaloc_desc(query_rgb, retr_model, dev)
+        else:
+            # AnyLoc
+            vlad_centers = db.get("vlad_centers")
+            img_size = int(fc.get("dino_img_size", 322))
+            dino_name = fc.get("dino_model", "dinov2_vitb14")
+            if "_dino_model" not in step5_retrieval.__dict__:
+                import torch
+                step5_retrieval.__dict__["_dino_model"] = torch.hub.load(
+                    "facebookresearch/dinov2", dino_name).eval().to(dev)
+            dino = step5_retrieval.__dict__["_dino_model"]
+            q_patches = _extract_dino_patches(query_rgb, dino, dev, img_size)
+            q_gd = _compute_vlad(q_patches, vlad_centers)
+
+        q_gd = q_gd / (np.linalg.norm(q_gd) + 1e-8)
+        dists, idxs = db["kdtree"].query(q_gd, k=top_k)
+        cos_sims  = 1.0 - dists**2 / 2.0
+        candidates = [db["entries"][i] for i in idxs]
+        print(f"    Retrieval top1: #{candidates[0]['id']}  sim={cos_sims[0]:.4f}")
+
+        # ── LoFTR matching on all candidates → best ───────────────────
+        q_tensor, q_sx, q_sy = to_gray_tensor(query_rgb)
+        best_n = -1; best_mkpts_q = best_mkpts_r = best_confs = None
+        best_cand = candidates[0]; best_ref_rgb = None
+
+        for rank, cand in enumerate(candidates):
+            ref_rgb = cv2.cvtColor(cv2.imread(cand["rgb_path"]), cv2.COLOR_BGR2RGB)
+            r_tensor, r_sx, r_sy = to_gray_tensor(ref_rgb)
+            try:
+                batch = {"image0": q_tensor, "image1": r_tensor}
+                with torch.no_grad():
+                    matcher(batch)
+                mkpts0 = batch["mkpts0_f"].cpu().numpy() * np.array([q_sx, q_sy])
+                mkpts1 = batch["mkpts1_f"].cpu().numpy() * np.array([r_sx, r_sy])
+                confs  = batch["mconf"].cpu().numpy()
+            except Exception as e:
+                print(f"    Rank{rank+1} LoFTR failed: {e}"); continue
+
+            mask   = confs >= conf_thresh
+            n_good = int(mask.sum())
+            print(f"    Rank{rank+1} #{cand['id']}: {n_good} matches")
+            if n_good > best_n:
+                best_n = n_good
+                best_mkpts_q = mkpts0[mask]; best_mkpts_r = mkpts1[mask]
+                best_confs = confs[mask]; best_cand = cand; best_ref_rgb = ref_rgb
+
+        # ── 시각화 저장 ───────────────────────────────────────────────
+        if best_ref_rgb is None:
+            best_ref_rgb = cv2.cvtColor(cv2.imread(candidates[0]["rgb_path"]), cv2.COLOR_BGR2RGB)
+
+        h1, w1 = query_rgb.shape[:2]; h2, w2 = best_ref_rgb.shape[:2]
+        canvas = np.zeros((max(h1,h2), w1+w2, 3), dtype=np.uint8)
+        canvas[:h1, :w1] = query_rgb; canvas[:h2, w1:] = best_ref_rgb
+
+        fig, ax = plt.subplots(1, 1, figsize=(18, 6))
+        ax.imshow(canvas)
+        if best_n > 0 and best_mkpts_q is not None:
+            cmap_v = plt.cm.RdYlGn(best_confs / (best_confs.max() + 1e-8))
+            step_v = max(1, best_n // 300)
+            for i in range(0, best_n, step_v):
+                ax.plot([best_mkpts_q[i,0], best_mkpts_r[i,0]+w1],
+                        [best_mkpts_q[i,1], best_mkpts_r[i,1]],
+                        c=cmap_v[i], alpha=0.5, linewidth=0.8)
+            ax.scatter(best_mkpts_q[:,0], best_mkpts_q[:,1], c="cyan",   s=6, zorder=3)
+            ax.scatter(best_mkpts_r[:,0]+w1, best_mkpts_r[:,1], c="yellow", s=6, zorder=3)
+
+        ax.set_title(f"{stem}  →  best=#{best_cand['id']}  ({best_n} matches, conf≥{conf_thresh})")
+        ax.axis("off"); fig.tight_layout()
+        out_png = os.path.join(save_dir, f"{stem}.png")
+        fig.savefig(out_png, dpi=120); plt.close()
+        print(f"    Saved: step6a_results/{stem}.png")
+
+    print(f"\n  Done. {len(query_files)} results in {save_dir}/")
+
+
+# =============================================================================
 # STEP 7: 2D-3D Correspondence + PnP  (Algorithm 1: T_WQ = T_WR × T_QR⁻¹)
 # =============================================================================
 def step7_pnp(step6_data, step5_data, config, output_dir):
@@ -1708,7 +1908,7 @@ def run_test_batch(test_dir, db, config, output_dir, gt_poses_path=None):
 # Main
 # =============================================================================
 OFFLINE_STEPS = ["0_align", "1_viewpoints", "2_render", "3_global_desc", "4_build_db"]
-ONLINE_STEPS  = ["5_retrieval", "6_match", "7_pnp"]
+ONLINE_STEPS  = ["5_retrieval", "6_match", "6a_match_viz", "7_pnp"]
 STEPS = OFFLINE_STEPS + ONLINE_STEPS
 
 
@@ -1726,6 +1926,8 @@ def main():
                         choices=["all","offline","online","test"] + STEPS)
     parser.add_argument("--query_image", default=None,
                         help="Query 이미지 경로 (없으면 DB 내 self-test)")
+    parser.add_argument("--query_dir",  default=None,
+                        help="step 6a_match_viz: 배치 쿼리 이미지 폴더")
     parser.add_argument("--test_dir",    default=None,
                         help="배치 테스트용 이미지 디렉토리 또는 단일 파일")
     parser.add_argument("--gt_poses",   default=None,
@@ -1755,6 +1957,28 @@ def main():
         rendered = step2_render(args.ply_map, vps, config, args.output_dir, s0)
     else:
         rendered = _load(args.output_dir, "step2_data.pkl") or []
+        if not rendered:
+            # step2_data.pkl 없으면 rendered/ 폴더의 실사 이미지로 대체
+            rgb_dir   = os.path.join(args.output_dir, "rendered", "rgb")
+            depth_dir = os.path.join(args.output_dir, "rendered", "depth")
+            if os.path.isdir(rgb_dir):
+                rgb_files = sorted(glob.glob(os.path.join(rgb_dir, "*.jpg")) +
+                                   glob.glob(os.path.join(rgb_dir, "*.png")))
+                rendered = []
+                for i, rgb_path in enumerate(rgb_files):
+                    stem = os.path.splitext(os.path.basename(rgb_path))[0]
+                    depth_path = os.path.join(depth_dir, stem + ".depth")
+                    if not os.path.exists(depth_path):
+                        depth_path = os.path.join(depth_dir, stem + ".png")
+                    rendered.append({
+                        "id":         i,
+                        "rgb_path":   rgb_path,
+                        "depth_path": depth_path if os.path.exists(depth_path) else "",
+                        "pose":       np.eye(4),   # 포즈 없음 → step6 PnP 불가
+                        "floor":      0,
+                        "yaw":        0.0,
+                    })
+                print(f"  [step2 fallback] {len(rendered)} real images loaded from {rgb_dir}")
 
     need_gd = run_offline or args.step in ("3_global_desc", "4_build_db")
     if run_offline or args.step == "3_global_desc":
@@ -1799,6 +2023,12 @@ def main():
         if s5 is None:
             print("ERROR: step5_data.pkl 없음. 5_retrieval 먼저 실행.")
             return
+
+    if args.step == "6a_match_viz":
+        if not args.query_dir:
+            print("ERROR: --query_dir 를 지정하세요."); return
+        step6a_match_viz(args.query_dir, db, config, args.output_dir)
+        return
 
     s6 = None
     if run_online or args.step == "6_match":
