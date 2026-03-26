@@ -84,11 +84,15 @@ def default_config():
             "fill_radius": 2.0,
         },
         "features": {
-            # DINOv2 + VLAD global descriptor
+            # global descriptor 방법 선택: "anyloc" (DINOv2+VLAD) 또는 "megaloc"
+            "global_desc_method": "megaloc",
+            # DINOv2 + VLAD global descriptor (anyloc)
             "dino_model": "dinov2_vitb14",   # vitb14(768d) / vits14(384d) / vitl14(1024d)
             "dino_img_size": 322,            # 14의 배수 (322=23×14, 224=16×14)
             "vlad_clusters": 64,             # VLAD cluster 수 (AnyLoc default)
             "vlad_pca_dim": 4096,            # PCA whitening 후 최종 dim
+            # MegaLoc (SOTA retrieval)
+            "megaloc_dim": 8448,             # 기본 descriptor 차원
             # EfficientLoFTR checkpoint path (자동 탐색)
             "eloftr_ckpt": "",   # 비워두면 EfficientLoFTR/weights/... 자동 탐색
             "eloftr_opt": False,  # True=빠른 추론(opt_default_cfg), False=최고 품질
@@ -791,6 +795,28 @@ def _compute_vlad(patch_feats, centers):
     return vlad
 
 
+def _megaloc_preprocess(img_rgb, resize=518):
+    """MegaLoc 입력 전처리: (H,W,3) uint8 → [1,3,resize,resize] float tensor (ImageNet norm)
+    resize=518: MegaLoc 학습 해상도 (DINOv2 ViT-B/14, 37×14=518). 다른 크기는 품질 저하."""
+    import torch, torchvision.transforms as T
+    tf = T.Compose([
+        T.ToPILImage(),
+        T.Resize((resize, resize)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    return tf(img_rgb).unsqueeze(0)   # [1, 3, resize, resize]
+
+
+def _extract_megaloc_desc(img_rgb, model, dev):
+    """MegaLoc 전역 디스크립터 추출: (megaloc_dim,) float32, L2-normalized"""
+    import torch
+    t = _megaloc_preprocess(img_rgb).to(dev)
+    with torch.no_grad():
+        desc = model(t).cpu().numpy().flatten()
+    return desc.astype(np.float32)
+
+
 def step3_global_desc(rendered, config, output_dir):
     """
     DINOv2 patch features → VLAD aggregation (AnyLoc 방식).
@@ -799,12 +825,49 @@ def step3_global_desc(rendered, config, output_dir):
     3) 각 이미지에 대해 VLAD descriptor 계산
     최종 dim = vlad_clusters × dino_feat_dim
     """
-    print("\n" + "="*60 + "\nSTEP 3: Global descriptors (DINOv2 + VLAD)\n" + "="*60)
     import torch
+    fc     = config["features"]
+    method = fc.get("global_desc_method", "megaloc")
+    dev    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ── MegaLoc 분기 ─────────────────────────────────────────────────────
+    if method == "megaloc":
+        print("\n" + "="*60 + "\nSTEP 3: Global descriptors (MegaLoc)\n" + "="*60)
+        print("  Loading MegaLoc from torch.hub …")
+        model = torch.hub.load("gmberton/MegaLoc", "get_trained_model")
+        model.eval().to(dev)
+        print(f"  MegaLoc loaded  →  descriptor dim={fc.get('megaloc_dim', 8448)}")
+
+        for i, r in enumerate(rendered):
+            img_bgr = cv2.imread(r["rgb_path"])
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            r["global_descriptor"] = _extract_megaloc_desc(img_rgb, model, dev)
+            r["global_desc_method"] = "megaloc"
+            if (i + 1) % 50 == 0 or i == 0:
+                print(f"    {i+1}/{len(rendered)}")
+
+        # 시각화: similarity matrix
+        nv = min(100, len(rendered))
+        if nv >= 2:
+            idx = np.linspace(0, len(rendered)-1, nv, dtype=int)
+            dm  = np.array([rendered[i]["global_descriptor"] for i in idx], dtype=np.float32)
+            sim = dm @ dm.T
+            fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+            ax.imshow(sim, cmap="hot", vmin=0, vmax=1)
+            ax.set_title(f"Step 3: MegaLoc similarity  (dim={dm.shape[1]})", fontsize=13)
+            fig.tight_layout()
+            fig.savefig(os.path.join(output_dir, "step3_global_desc.png"), dpi=150); plt.close()
+            print(f"  Saved: step3_global_desc.png")
+
+        slim = _slim(rendered)
+        pickle.dump({"rendered": slim},
+                    open(os.path.join(output_dir, "step3_data.pkl"), "wb"))
+        return rendered, None   # centers=None (VLAD vocabulary 불필요)
+
+    # ── AnyLoc 분기 (기존 DINOv2+VLAD) ─────────────────────────────────
+    print("\n" + "="*60 + "\nSTEP 3: Global descriptors (DINOv2 + VLAD)\n" + "="*60)
     from sklearn.cluster import MiniBatchKMeans
 
-    fc       = config["features"]
-    dev      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dino_name = fc.get("dino_model", "dinov2_vitb14")
     img_size  = int(fc.get("dino_img_size", 322))
     n_clusters = int(fc.get("vlad_clusters", 64))
@@ -849,6 +912,7 @@ def step3_global_desc(rendered, config, output_dir):
     for i, (r, pf) in enumerate(zip(rendered, per_image_patches)):
         r["global_descriptor"] = _compute_vlad(pf, centers)
         r["vlad_vocab"] = centers   # step4에서 db에 저장하기 위해 첫 entry에만 있으면 됨
+        r["global_desc_method"] = "anyloc"
 
     # ── 시각화: similarity matrix + PCA ───────────────────────────────
     nv  = min(100, len(rendered))
@@ -917,16 +981,21 @@ def step4_build_db(rendered, output_dir):
 
     kdtree = KDTree(global_descs_normed)
 
-    # VLAD vocabulary + PCA model: rendered[0]에서 꺼냄 (step3에서 저장)
+    # VLAD vocabulary + PCA model: rendered[0]에서 꺼냄 (anyloc 방식만 존재)
     vlad_centers = None
+    pca_model    = None
+    global_desc_method = "anyloc"
     for r in rendered:
+        if r.get("global_desc_method"):
+            global_desc_method = r["global_desc_method"]
         if r.get("vlad_vocab") is not None:
             vlad_centers = r["vlad_vocab"]
             pca_model    = r.get("pca_model")
             break
 
     db = {"global_descs": global_descs_normed, "kdtree": kdtree,
-          "entries": entries, "vlad_centers": vlad_centers, "pca_model": pca_model}
+          "entries": entries, "vlad_centers": vlad_centers, "pca_model": pca_model,
+          "global_desc_method": global_desc_method}
     db_pkl = os.path.join(output_dir, "step4_database.pkl")
     db_npz = os.path.join(output_dir, "step4_database.npz")
     pickle.dump(db, open(db_pkl, "wb"))
@@ -985,32 +1054,39 @@ def step5_retrieval(query_image_path, db, config, output_dir):
         query_rgb = cv2.cvtColor(cv2.imread(gt_entry["rgb_path"]), cv2.COLOR_BGR2RGB)
         print(f"  Query: DB entry #{gt_entry['id']} (self-test)")
 
-    # ── VLAD vocabulary 로드 ───────────────────────────────────────────
-    vlad_centers = db.get("vlad_centers")
-    if vlad_centers is None:
-        raise RuntimeError("DB에 vlad_centers가 없습니다. step3→step4를 재실행하세요.")
-
-    dino_name  = fc.get("dino_model", "dinov2_vitb14")
-    img_size   = int(fc.get("dino_img_size", 322))
-    n_clusters = vlad_centers.shape[0]
-    feat_dim   = vlad_centers.shape[1]
-    vlad_dim   = n_clusters * feat_dim
-    print(f"  DINOv2: {dino_name}  img_size={img_size}  "
-          f"VLAD K={n_clusters}  dim={vlad_dim}")
-
-    # 모델 캐시 (같은 프로세스 내 재사용)
+    # ── Query descriptor (방법은 DB에 저장된 global_desc_method 기준) ──
     _cache = step5_retrieval.__dict__
-    if "_dino_model" not in _cache or _cache.get("_dino_name") != dino_name:
-        model = torch.hub.load("facebookresearch/dinov2", dino_name, pretrained=True)
-        model.eval().to(dev)
-        _cache["_dino_model"] = model
-        _cache["_dino_name"]  = dino_name
-        print(f"  Loaded DINOv2: {dino_name}")
-    model = _cache["_dino_model"]
+    global_desc_method = db.get("global_desc_method", "anyloc")
 
-    # ── Query descriptor ───────────────────────────────────────────────
-    q_patches = _extract_dino_patches(query_rgb, model, dev, img_size)
-    q_gd_norm = _compute_vlad(q_patches, vlad_centers)
+    if global_desc_method == "megaloc":
+        print(f"  Method: MegaLoc  (dim={fc.get('megaloc_dim', 8448)})")
+        if "_megaloc_model" not in _cache:
+            print("  Loading MegaLoc …")
+            model = torch.hub.load("gmberton/MegaLoc", "get_trained_model")
+            model.eval().to(dev)
+            _cache["_megaloc_model"] = model
+        model = _cache["_megaloc_model"]
+        q_gd_norm = _extract_megaloc_desc(query_rgb, model, dev)
+        q_gd_norm = q_gd_norm / (np.linalg.norm(q_gd_norm) + 1e-8)
+
+    else:   # anyloc (DINOv2 + VLAD)
+        vlad_centers = db.get("vlad_centers")
+        if vlad_centers is None:
+            raise RuntimeError("DB에 vlad_centers가 없습니다. step3→step4를 재실행하세요.")
+        dino_name  = fc.get("dino_model", "dinov2_vitb14")
+        img_size   = int(fc.get("dino_img_size", 322))
+        n_clusters = vlad_centers.shape[0]
+        feat_dim   = vlad_centers.shape[1]
+        print(f"  Method: AnyLoc  DINOv2={dino_name}  VLAD K={n_clusters}  dim={n_clusters*feat_dim}")
+        if "_dino_model" not in _cache or _cache.get("_dino_name") != dino_name:
+            model = torch.hub.load("facebookresearch/dinov2", dino_name, pretrained=True)
+            model.eval().to(dev)
+            _cache["_dino_model"] = model
+            _cache["_dino_name"]  = dino_name
+            print(f"  Loaded DINOv2: {dino_name}")
+        model = _cache["_dino_model"]
+        q_patches = _extract_dino_patches(query_rgb, model, dev, img_size)
+        q_gd_norm = _compute_vlad(q_patches, vlad_centers)
 
     # ── KDTree retrieval ───────────────────────────────────────────────
     dists, idxs = db["kdtree"].query(q_gd_norm, k=top_k)
@@ -1645,7 +1721,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ply_map",    required=True)
     parser.add_argument("--config",     default="config/render_loc.yaml")
-    parser.add_argument("--output_dir", default="output/step_by_step")
+    parser.add_argument("--output_dir", default="output/MegaLoc")
     parser.add_argument("--step",       default="all",
                         choices=["all","offline","online","test"] + STEPS)
     parser.add_argument("--query_image", default=None,
