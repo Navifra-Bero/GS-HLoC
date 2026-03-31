@@ -16,7 +16,6 @@ Panels:
         - /Trajectory1
         - /Matching Points1
         - /Matching Lines1
-        - /View Footprint1
       Splitter Ratio: 0.5
     Tree Height: 850
   - Class: rviz_common/Selection
@@ -232,7 +231,7 @@ Visualization Manager:
         frustum: true
         frustum_image: true
       Topic:
-        Depth: 5
+        Depth: 10
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
@@ -269,7 +268,7 @@ Visualization Manager:
       Namespaces:
         trajectory: true
       Topic:
-        Depth: 5
+        Depth: 10
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
@@ -304,7 +303,7 @@ Visualization Manager:
       Size (m): 0.2
       Style: Spheres
       Topic:
-        Depth: 5
+        Depth: 10
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
@@ -328,21 +327,6 @@ Visualization Manager:
         Value: /matching_lines
       Value: true
 
-    # ── 2D FOV footprint (바닥면 사다리꼴) ───────────────────────────
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: View Footprint
-      Namespaces:
-        view_footprint: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Best Effort
-        Value: /view_footprint
-      Value: true
-
   Enabled: true
   Global Options:
     Background Color: 35; 35; 35
@@ -361,47 +345,29 @@ Visualization Manager:
   Views:
     # cam_fp: 카메라에서 frust_d(2m) 전방에 위치
     # ThirdPersonFollower(distance=2m)로 cam_fp를 추적하면
-    # RViz 카메라가 실제 카메라 위치에서 정면을 바라보는 1인칭 시점이 됨
+    # RViz 카메라가 실제 카메라 위치에서 정면을 바라보는 1인칭 시점이 
+
     Current:
-      Class: rviz_default_plugins/ThirdPersonFollower
-      Distance: 2.0
+      Class: rviz_default_plugins/Orbit
+      Distance: 50.0
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.06
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05
       Invert Z Axis: false
-      Name: FirstPerson (follow frustum)
+      Name: TopDown Fixed
       Near Clip Distance: 0.01
-      Pitch: 0.3
-      Target Frame: cam_fp
-      Value: ThirdPersonFollower (rviz)
+      Pitch: 1.5707
+      Target Frame: <Fixed Frame>
+      Value: Orbit (rviz)
       Yaw: 0
-      Roll :
-#
-    #Current:
-    #  Class: rviz_default_plugins/Orbit
-    #  Distance: 50.0
-    #  Enable Stereo Rendering:
-    #    Stereo Eye Separation: 0.06
-    #    Stereo Focal Distance: 1
-    #    Swap Stereo Eyes: false
-    #    Value: false
-    #  Focal Point:
-    #    X: 0
-    #    Y: 0
-    #    Z: 0
-    #  Focal Shape Fixed Size: true
-    #  Focal Shape Size: 0.05
-    #  Invert Z Axis: false
-    #  Name: TopDown Fixed
-    #  Near Clip Distance: 0.01
-    #  Pitch: 1.5707
-    #  Target Frame: <Fixed Frame>
-    #  Value: Orbit (rviz)
-    #  Yaw: 0
     Saved:
       - Class: rviz_default_plugins/ThirdPersonFollower
         Distance: 8.0
