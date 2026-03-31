@@ -372,6 +372,55 @@ def make_trajectory_marker(positions, frame_id, stamp, interp_pts=8):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FOV footprint marker — 카메라 FOV를 바닥면에 투영한 2D 사다리꼴
+# ─────────────────────────────────────────────────────────────────────────────
+def make_view_footprint_marker(T_WC, fx, fy, cx, cy, W, H,
+                               depth, frame_id, stamp,
+                               color=(1.0, 0.9, 0.0), line_width=0.06):
+    """
+    카메라 앞 depth 거리의 far-plane 사각형(4코너)을 LINE_LIST로 생성.
+    이미지 4개 모서리를 카메라 공간에서 depth 만큼 투영 → world 변환.
+    """
+    R = T_WC[:3, :3]
+    t = T_WC[:3, 3]
+
+    corners_img = [(0, 0), (W-1, 0), (W-1, H-1), (0, H-1)]
+    corners_world = []
+    for u, v in corners_img:
+        # 카메라 공간에서 depth 거리의 3D 점
+        pt_cam = np.array([(u - cx) / fx * depth,
+                           (v - cy) / fy * depth,
+                           depth])
+        pt_world = R @ pt_cam + t
+        corners_world.append(pt_world)
+
+    c0, c1, c2, c3 = corners_world
+
+    # 코너 4개를 이어 닫힌 사각형
+    segments = [
+        (c0, c1), (c1, c2), (c2, c3), (c3, c0),
+    ]
+
+    m = Marker()
+    m.header.frame_id = frame_id
+    m.header.stamp    = stamp
+    m.ns    = "view_footprint"
+    m.id    = 0
+    m.type  = Marker.LINE_LIST
+    m.action = Marker.ADD
+    m.scale.x = line_width
+    m.color.r, m.color.g, m.color.b, m.color.a = color[0], color[1], color[2], 0.85
+    m.pose.orientation.w = 1.0
+    for a, b in segments:
+        for pt in (a, b):
+            m.points.append(Point(x=float(pt[0]), y=float(pt[1]), z=float(pt[2])))
+
+    ma = MarkerArray()
+    ma.markers.append(m)
+    return ma
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Rotation matrix → quaternion
 # ─────────────────────────────────────────────────────────────────────────────
 def rot2quat(R):
@@ -399,7 +448,7 @@ class MapLocalizerViewer(Node):
         super().__init__('map_localizer_viewer')
 
         base = '/home/park/loc_ws/src/render_loc'
-        out  = os.path.join(base, 'output/step_by_step')
+        out  = os.path.join(base, 'output/MegaLoc')
 
         self.declare_parameter('aligned_ply',
             os.path.join(out, 'aligned_map.ply'))
@@ -422,6 +471,8 @@ class MapLocalizerViewer(Node):
         self.declare_parameter('frustum_depth',  2.0)
         self.declare_parameter('frustum_grid_w', 80)
         self.declare_parameter('frustum_grid_h', 50)
+        self.declare_parameter('view_footprint_range', 15.0)  # FOV footprint 투영 거리 (m)
+        self.declare_parameter('view_footprint_floor_z', 0.0) # 바닥면 z 높이 (m)
         self.declare_parameter('step6_results_dir', '')  # test_results/cam_X 경로 (비워두면 스킵)
         self.declare_parameter('match_line_alpha',  0.2) # 연두색 라인 투명도 (0.0~1.0)
         self.declare_parameter('live_image_topic', '')   # 설정 시 subscriber 동기화 모드
@@ -446,6 +497,8 @@ class MapLocalizerViewer(Node):
         self.frust_d      = float(self.get_parameter('frustum_depth').value)
         self.frust_grid_w = max(2, int(self.get_parameter('frustum_grid_w').value))
         self.frust_grid_h = max(2, int(self.get_parameter('frustum_grid_h').value))
+        self._fp_range    = float(self.get_parameter('view_footprint_range').value)
+        self._fp_floor_z  = float(self.get_parameter('view_footprint_floor_z').value)
         step6_results_dir       = self.get_parameter('step6_results_dir').value
         self._match_line_alpha  = float(self.get_parameter('match_line_alpha').value)
         live_image_topic        = self.get_parameter('live_image_topic').value
@@ -575,6 +628,7 @@ class MapLocalizerViewer(Node):
         self.pub_matching   = self.create_publisher(PointCloud2, '/matching_points', VOLATILE)
         self.pub_match_lines= self.create_publisher(MarkerArray, '/matching_lines',  VOLATILE)
         self.pub_bbox       = self.create_publisher(MarkerArray, '/visible_bbox',    VOLATILE)
+        self.pub_footprint  = self.create_publisher(MarkerArray, '/view_footprint',  VOLATILE)
         # frustum wireframe + image → 하나의 MarkerArray로 동시 발행
         self.pub_frustum    = self.create_publisher(MarkerArray, '/camera_frustum',  VOLATILE)
         self.pub_pose       = self.create_publisher(PoseStamped, '/camera_pose',     VOLATILE)
@@ -758,6 +812,10 @@ class MapLocalizerViewer(Node):
         self.pub_match_lines.publish(match_lines_ma)
         self.pub_visible.publish(make_pointcloud2(vis_xyz,   vis_rgb,   fid, stamp))
         self.pub_bbox.publish(make_bbox_marker(vis_xyz, fid, stamp))
+        self.pub_footprint.publish(
+            make_view_footprint_marker(
+                T_WC, self.fx, self.fy, self.cx, self.cy,
+                self.img_W, self.img_H, self.frust_d, fid, stamp))
         self.pub_pose.publish(pose_msg)
         self.pub_traj.publish(make_trajectory_marker(self.traj_positions, fid, stamp))
         if img_rgb is not None:

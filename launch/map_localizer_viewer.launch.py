@@ -40,9 +40,9 @@ def generate_launch_description():
         DeclareLaunchArgument('aligned_ply',
             default_value=os.path.join(out, 'aligned_map.ply')),
         DeclareLaunchArgument('vis_ply',
-            default_value=os.path.join(out, 'aligned_map_01.ply')),   # 0.1m pre-downsampled
+            default_value=os.path.join(out, 'aligned_map_01_2.ply')),   # 0.1m pre-downsampled
         DeclareLaunchArgument('bg_ply',
-            default_value=os.path.join(out, 'aligned_map_01.ply')),   # 0.4m pre-downsampled
+            default_value=os.path.join(out, 'aligned_map_04_2.ply')),   # 0.4m pre-downsampled
         DeclareLaunchArgument('trajectory_json',
             default_value=os.path.join(out, 'test_results/cam_3/trajectory_poses.json')),
         DeclareLaunchArgument('images_dir',
@@ -81,6 +81,13 @@ def generate_launch_description():
         DeclareLaunchArgument('cy', default_value='560.826738'),
         DeclareLaunchArgument('img_width', default_value='1920'),
         DeclareLaunchArgument('img_height', default_value='1200'),
+        # Femto 카메라
+        # DeclareLaunchArgument('fx', default_value='2256.627197'),
+        # DeclareLaunchArgument('fy', default_value='2254.400635'),
+        # DeclareLaunchArgument('cx', default_value='1891.352783'),
+        # DeclareLaunchArgument('cy', default_value='1087.097656'),
+        # DeclareLaunchArgument('img_width', default_value='3840'),
+        # DeclareLaunchArgument('img_height', default_value='2160'),
         DeclareLaunchArgument('no_rviz',    default_value='false'),
         DeclareLaunchArgument('step6_results_dir',
             default_value=os.path.join(out, 'test_results/cam_3')),
