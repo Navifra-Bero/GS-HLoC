@@ -8,8 +8,8 @@ numpy>=1.21.0
 pyyaml>=6.0
 
 # Deep learning
-torch>=2.0.0
-torchvision>=0.15.0
+# torch>=2.0.0
+# torchvision>=0.15.0
 
 # Visualization
 matplotlib>=3.5.0
@@ -19,3 +19,6 @@ scikit-learn>=1.0.0   # PCA for step 4
 # Optional: better global descriptors
 # eigenplaces
 # pytorch-NetVlad
+
+gsplat
+scikit-image
