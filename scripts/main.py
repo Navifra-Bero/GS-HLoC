@@ -54,7 +54,7 @@ def main():
                         help="3DGS 학습 epoch 수 (1 epoch = 전체 이미지 1회)")
     parser.add_argument("--gs_subsample", type=int, default=1,
                         help="매핑 이미지 서브샘플 간격 (기본 1=전체)")
-    parser.add_argument("--gs_voxel_size", type=float, default=0.05,
+    parser.add_argument("--gs_voxel_size", type=float, default=0.03,
                         help="GS 학습 전 voxel downsample 크기(m). 예: 0.05")
     parser.add_argument("--gs_train_size", type=int, default=1920,
                         help="GS 학습 시 이미지 리사이즈 (긴 쪽 기준, 비율 유지)")

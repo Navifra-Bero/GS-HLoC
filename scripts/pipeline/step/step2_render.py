@@ -360,6 +360,21 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
         records_txt = os.path.join(kapture_dir, "records_camera.txt")
         images_root = os.path.join(kapture_dir, "records_data")
 
+        # depth records 파싱 (있으면)
+        depth_records_txt = os.path.join(kapture_dir, "records_depth.txt")
+        depth_map = {}   # (ts, dev) → depth file path
+        if os.path.exists(depth_records_txt):
+            for line in open(depth_records_txt):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                p = [x.strip() for x in line.split(",")]
+                if len(p) >= 3:
+                    dpath = os.path.join(images_root, p[2])
+                    if os.path.exists(dpath):
+                        depth_map[(p[0], p[1])] = dpath
+            print(f"  Depth records: {len(depth_map)}")
+
         sensor_params = _gs_parse_sensors(sensors_txt)
         traj          = _gs_parse_trajectories(traj_txt)
         records       = _gs_parse_records(records_txt)
@@ -381,12 +396,15 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                 "path": img_path,
                 "T_c2w": T_c2w_aligned.astype(np.float32),
                 "cam": sensor_params[dev],
+                "depth_path": depth_map.get(key),
             })
-        print(f"  Train frames: {len(train_data)}")
+        print(f"  Train frames: {len(train_data)}  "
+              f"(with depth: {sum(1 for d in train_data if d['depth_path'])})")
         if not train_data:
             raise RuntimeError("학습 이미지를 찾을 수 없습니다. kapture_dir 경로를 확인하세요.")
 
         # ── 4. 학습 루프 (DefaultStrategy: densification + pruning)
+        MEANS_LR = 1.6e-4
         params = {
             "means":     means,
             "scales":    scales,
@@ -395,7 +413,7 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
             "colors_sh": colors_sh,
         }
         optimizers = {
-            "means":     torch.optim.Adam([means],     lr=1.6e-4),
+            "means":     torch.optim.Adam([means],     lr=MEANS_LR),
             "scales":    torch.optim.Adam([scales],    lr=5e-3),
             "quats":     torch.optim.Adam([quats],     lr=1e-3),
             "opacities": torch.optim.Adam([opacities], lr=5e-2),
@@ -407,7 +425,7 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
         total_iters = gs_epochs * iters_per_epoch
 
         means_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizers["means"], T_max=total_iters, eta_min=1.6e-4 * 0.01
+            optimizers["means"], T_max=total_iters, eta_min=MEANS_LR * 0.01
         )
 
         scene_scale = float(np.linalg.norm(
@@ -415,10 +433,12 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
 
         strategy = DefaultStrategy(
             verbose=False,
-            refine_start_iter=iters_per_epoch * 2,          # 2 epoch 후 시작
-            refine_stop_iter=int(total_iters * 0.75),       # 75% 지점에서 중단
-            refine_every=max(1, iters_per_epoch // 5),      # epoch당 ~5회 refine
-            reset_every=iters_per_epoch * 3,                # 3 epoch마다 opacity reset
+            refine_start_iter=iters_per_epoch * 2,
+            refine_stop_iter=int(total_iters * 0.75),
+            refine_every=max(1, iters_per_epoch // 5),
+            reset_every=iters_per_epoch * 3,
+            prune_opa=0.005,
+            prune_scale3d=0.1,
         )
         state = strategy.initialize_state(scene_scale=scene_scale)
 
@@ -432,6 +452,9 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
         for epoch in range(gs_epochs):
             random.shuffle(train_indices)
             epoch_loss = 0.0
+            epoch_rgb_loss = 0.0
+            epoch_depth_loss = 0.0
+            epoch_depth_count = 0
             epoch_count = 0
             data_idx = 0
 
@@ -489,22 +512,48 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                         near_plane=0.1,
                         far_plane=100.0,
                         packed=True,
+                        render_mode="RGB+D",
                     )
                     pred = renders[0, ..., :3].clamp(0, 1)
+                    pred_depth = renders[0, ..., 3]     # (H, W)
 
-                    # L1 + SSIM loss
+                    # ── RGB loss: L1 + SSIM
                     l1_loss = F.l1_loss(pred, gt)
                     pred_bchw = pred.permute(2, 0, 1).unsqueeze(0)
                     gt_bchw   = gt.permute(2, 0, 1).unsqueeze(0)
                     ssim_val  = _ssim_fn(pred_bchw, gt_bchw, data_range=1.0, size_average=True)
-                    loss = (0.8 * l1_loss + 0.2 * (1.0 - ssim_val)) / accum_steps
+                    rgb_loss = 0.8 * l1_loss + 0.2 * (1.0 - ssim_val)
 
+                    # ── Depth supervision (sparse depth가 있을 때)
+                    depth_loss = torch.tensor(0.0, device=device)
+                    if entry.get("depth_path"):
+                        gt_depth_raw = np.fromfile(entry["depth_path"], dtype=np.float32)
+                        if len(gt_depth_raw) == cam["h"] * cam["w"]:
+                            gt_depth_full = gt_depth_raw.reshape(cam["h"], cam["w"])
+                            gt_depth_resized = cv2.resize(gt_depth_full, (new_w, new_h),
+                                                          interpolation=cv2.INTER_NEAREST)
+                            gt_depth_t = torch.from_numpy(gt_depth_resized).to(device)
+                            valid_mask = gt_depth_t > 0.1
+                            if valid_mask.sum() > 10:
+                                depth_loss = F.l1_loss(
+                                    torch.log1p(pred_depth[valid_mask]),
+                                    torch.log1p(gt_depth_t[valid_mask]))
+
+                    # ── Total loss (depth 가중치: 1.0 → 0.1로 linear decay)
+                    depth_w = max(0.1, 1.0 - 0.9 * (global_it / total_iters))
+                    loss = (rgb_loss + depth_w * depth_loss) / accum_steps
+
+                    # DefaultStrategy: 마지막 sub-step에서 retain_grad
                     if acc == accum_steps - 1:
                         strategy.step_pre_backward(params, optimizers, state, global_it, info)
 
                     loss.backward()
                     last_info = info
                     step_loss += loss.item()
+                    epoch_rgb_loss += rgb_loss.item()
+                    if depth_loss.item() > 0:
+                        epoch_depth_loss += depth_loss.item()
+                        epoch_depth_count += 1
 
                 strategy.step_post_backward(params, optimizers, state, global_it, last_info,
                                             packed=True)
@@ -513,21 +562,26 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                     opt.step()
                 means_scheduler.step()
 
-                epoch_loss += step_loss * accum_steps
+                epoch_loss += step_loss  # step_loss = sum of (loss / accum) over accum steps
                 epoch_count += 1
                 global_it += 1
 
                 # tqdm 진행바 업데이트
-                pbar.set_postfix(loss=f"{step_loss * accum_steps:.4f}",
+                pbar.set_postfix(loss=f"{step_loss:.4f}",
                                  GS=f"{len(params['means']):,}")
 
             pbar.close()
             avg_loss = epoch_loss / max(epoch_count, 1)
+            n_imgs = epoch_count * accum_steps
+            avg_rgb = epoch_rgb_loss / max(n_imgs, 1)
+            avg_depth = epoch_depth_loss / max(epoch_depth_count, 1)
             n_gs = len(params["means"])
-            print(f"  Epoch {epoch+1}/{gs_epochs}  avg_loss={avg_loss:.4f}  GS={n_gs:,}")
+            print(f"  Epoch {epoch+1}/{gs_epochs}  total={avg_loss:.4f}  "
+                  f"rgb={avg_rgb:.4f}  depth={avg_depth:.4f} (w={depth_w:.2f})  "
+                  f"GS={n_gs:,}")
 
             # ── 중간 체크포인트 + 샘플 렌더링 (20 epoch마다 + 마지막 epoch)
-            save_interval = 20
+            save_interval = 10
             is_save_epoch = ((epoch + 1) % save_interval == 0) or (epoch + 1 == gs_epochs)
             if is_save_epoch:
                 gs_dir = os.path.join(output_dir, "gaussian")
@@ -544,35 +598,39 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                     "colors_sh": params["colors_sh"].data,
                 }, ckpt_path)
 
-                # 샘플 viewpoint 1장 렌더링
-                if len(viewpoints) > 0:
-                    sample_vp = viewpoints[len(viewpoints) // 2]
+                # 샘플 viewpoint 10장 렌더링
+                n_samples = min(10, len(viewpoints))
+                if n_samples > 0:
+                    sample_indices = np.linspace(0, len(viewpoints) - 1, n_samples, dtype=int)
                     cam_cfg = config["camera"]
                     W_s, H_s = cam_cfg["width"], cam_cfg["height"]
                     K_s = torch.tensor([
                         [cam_cfg["fx"], 0, cam_cfg["cx"]],
                         [0, cam_cfg["fy"], cam_cfg["cy"]],
                         [0, 0, 1]], device=device).unsqueeze(0).float()
-                    vm_s = torch.from_numpy(
-                        np.linalg.inv(sample_vp["pose"].astype(np.float32))
-                    ).to(device).unsqueeze(0).float()
 
-                    with torch.no_grad():
-                        rend_s, _, _ = rasterization(
-                            means=params["means"].detach(),
-                            quats=F.normalize(params["quats"].detach(), dim=-1),
-                            scales=torch.exp(params["scales"].detach()),
-                            opacities=torch.sigmoid(params["opacities"].detach()),
-                            colors=params["colors_sh"].detach(),
-                            viewmats=vm_s, Ks=K_s,
-                            width=W_s, height=H_s,
-                            sh_degree=sh_degree,
-                            near_plane=0.1, far_plane=100.0,
-                            render_mode="RGB+D",
-                        )
-                    rgb_s = (rend_s[0, ..., :3].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
-                    sample_path = os.path.join(epoch_dir, "sample_render.png")
-                    cv2.imwrite(sample_path, cv2.cvtColor(rgb_s, cv2.COLOR_RGB2BGR))
+                    for si in sample_indices:
+                        sample_vp = viewpoints[si]
+                        vm_s = torch.from_numpy(
+                            np.linalg.inv(sample_vp["pose"].astype(np.float32))
+                        ).to(device).unsqueeze(0).float()
+
+                        with torch.no_grad():
+                            rend_s, _, _ = rasterization(
+                                means=params["means"].detach(),
+                                quats=F.normalize(params["quats"].detach(), dim=-1),
+                                scales=torch.exp(params["scales"].detach()),
+                                opacities=torch.sigmoid(params["opacities"].detach()),
+                                colors=params["colors_sh"].detach(),
+                                viewmats=vm_s, Ks=K_s,
+                                width=W_s, height=H_s,
+                                sh_degree=sh_degree,
+                                near_plane=0.3, far_plane=100.0,
+                                render_mode="RGB+D",
+                            )
+                        rgb_s = (rend_s[0, ..., :3].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+                        sample_path = os.path.join(epoch_dir, f"sample_{sample_vp['id']:06d}.png")
+                        cv2.imwrite(sample_path, cv2.cvtColor(rgb_s, cv2.COLOR_RGB2BGR))
 
                 print(f"    → Checkpoint saved: {epoch_dir}/")
 
@@ -592,6 +650,67 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
             "colors_sh": colors_sh.data,
         }, gs_ckpt)
         print(f"  [GS] 최종 모델 저장: {gs_ckpt}  ({len(means):,} GS)")
+
+        # 최종 가우시안 맵을 PLY로 저장
+        SH_C0 = 0.28209479177387814
+        gs_pts = means.data.cpu().numpy().astype(np.float32)
+        gs_scales_raw = torch.exp(scales.data).cpu().numpy().astype(np.float32)
+        gs_quats_raw = F.normalize(quats.data, dim=-1).cpu().numpy().astype(np.float32)
+        gs_rgb = (colors_sh.data[:, 0, :].cpu().numpy() * SH_C0 + 0.5).clip(0, 1)
+        gs_opa = torch.sigmoid(opacities.data).cpu().numpy().astype(np.float32)
+
+        # opacity 낮은 Gaussian 제거
+        valid = gs_opa > 0.05
+        gs_dir = os.path.join(output_dir, "gaussian")
+        os.makedirs(gs_dir, exist_ok=True)
+
+        # PLY (포인트클라우드 뷰어용)
+        gs_pcd = o3d.geometry.PointCloud()
+        gs_pcd.points = o3d.utility.Vector3dVector(gs_pts[valid])
+        gs_pcd.colors = o3d.utility.Vector3dVector(gs_rgb[valid])
+        gs_ply_path = os.path.join(gs_dir, "gaussian_map.ply")
+        o3d.io.write_point_cloud(gs_ply_path, gs_pcd, write_ascii=False, compressed=False)
+        print(f"  [GS] PLY 저장: {gs_ply_path}  "
+              f"({valid.sum():,}/{len(gs_opa):,} pts, opa>0.05)")
+
+        # .splat (WebGL 3D Gaussian Splat Viewer용)
+        # 형식: position(3×f32) + scale(3×f32) + rgba(4×u8) + quaternion(4×u8)
+        # = 12 + 12 + 4 + 4 = 32 bytes per Gaussian
+        v_pts    = gs_pts[valid]
+        v_scales = gs_scales_raw[valid]
+        v_rgb    = (gs_rgb[valid] * 255).clip(0, 255).astype(np.uint8)
+        v_opa    = (gs_opa[valid] * 255).clip(0, 255).astype(np.uint8)
+        v_quats  = gs_quats_raw[valid]
+        # quaternion을 uint8로: [-1,1] → [0,255]
+        v_quats_u8 = ((v_quats * 128) + 128).clip(0, 255).astype(np.uint8)
+
+        n_valid = int(valid.sum())
+        splat_buf = np.empty(n_valid, dtype=[
+            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+            ('sx', '<f4'), ('sy', '<f4'), ('sz', '<f4'),
+            ('r', 'u1'), ('g', 'u1'), ('b', 'u1'), ('a', 'u1'),
+            ('qw', 'u1'), ('qx', 'u1'), ('qy', 'u1'), ('qz', 'u1'),
+        ])
+        splat_buf['x']  = v_pts[:, 0]
+        splat_buf['y']  = v_pts[:, 1]
+        splat_buf['z']  = v_pts[:, 2]
+        splat_buf['sx'] = v_scales[:, 0]
+        splat_buf['sy'] = v_scales[:, 1]
+        splat_buf['sz'] = v_scales[:, 2]
+        splat_buf['r']  = v_rgb[:, 0]
+        splat_buf['g']  = v_rgb[:, 1]
+        splat_buf['b']  = v_rgb[:, 2]
+        splat_buf['a']  = v_opa
+        splat_buf['qw'] = v_quats_u8[:, 0]  # gsplat: [w,x,y,z]
+        splat_buf['qx'] = v_quats_u8[:, 1]
+        splat_buf['qy'] = v_quats_u8[:, 2]
+        splat_buf['qz'] = v_quats_u8[:, 3]
+
+        splat_path = os.path.join(gs_dir, "gaussian_map.splat")
+        splat_buf.tofile(splat_path)
+        splat_mb = os.path.getsize(splat_path) / 1e6
+        print(f"  [GS] Splat 저장: {splat_path}  "
+              f"({n_valid:,} GS, {splat_mb:.1f} MB)")
 
     # ── 5. grid viewpoints 렌더링
     import torch
@@ -630,7 +749,7 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                 width=W_out,
                 height=H_out,
                 sh_degree=sh_degree,
-                near_plane=0.1,
+                near_plane=0.3,
                 far_plane=100.0,
                 render_mode="RGB+D",
             )
