@@ -69,7 +69,7 @@ def default_config():
         },
         "alignment": {
             "normal_threshold": 0.8, "ransac_distance": 0.05,
-            "ransac_n": 3, "ransac_iterations": 1000, "pre_flip_x": False,
+            "ransac_n": 3, "ransac_iterations": 1000, "pre_flip_x": True,
         },
         "sampling": {
             "grid_resolution": 0.05, "path_spacing": 0.3,
@@ -148,12 +148,15 @@ def step0_align(ply_path, config, output_dir):
     has_color = pcd.has_colors()
     print(f"  Loaded: {len(points_orig)} points, color={has_color}")
 
-    # X축(오른쪽) 기준 180° 회전 — Y,Z 반전 (책장 넘기듯)
-    R_flip = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
-    pcd.points = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.points).T).T)
-    if pcd.has_normals():
-        pcd.normals = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.normals).T).T)
-    print("  Pre-flip: 180° around Z axis (X,Y 반전)")
+    # PLY가 down-top view인 경우 X축 기준 180° 사전 회전 (Y, Z 반전)
+    if align_cfg.get("pre_flip_x", False):
+        R_flip = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
+        pts = np.asarray(pcd.points)
+        pcd.points = o3d.utility.Vector3dVector((R_flip @ pts.T).T)
+        if pcd.has_normals():
+            nrm = np.asarray(pcd.normals)
+            pcd.normals = o3d.utility.Vector3dVector((R_flip @ nrm.T).T)
+        print("  Pre-flip: 180° around X axis applied (down-top → top-down)")
 
     if not pcd.has_normals():
         print("  Computing normals...")
@@ -214,7 +217,11 @@ def step0_align(ply_path, config, output_dir):
     size_gb = os.path.getsize(aligned_path) / 1e9
     print(f"  Saved: {aligned_path} ({size_gb:.2f} GB)")
 
-    R_total = R @ R_flip
+    if align_cfg.get("pre_flip_x", False):
+        R_flip = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
+        R_total = R @ R_flip
+    else:
+        R_total = R
     T_align = np.eye(4); T_align[:3,:3] = R_total; T_align[2,3] = -floor_z_after
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
@@ -736,341 +743,6 @@ def step2_render(ply_path, viewpoints, config, output_dir, step0_data=None):
     print(f"  Saved: step2_rendered.png")
     # rendered는 이미 경량 (rgb/depth 배열 없음) — _slim 불필요하지만 호환성 유지
     pickle.dump(rendered, open(os.path.join(output_dir, "step2_data.pkl"), "wb"))
-    return rendered
-
-
-# =============================================================================
-# STEP 2-GS: 3D Gaussian Splatting Rendering
-# =============================================================================
-
-def _gs_parse_sensors(sensors_txt):
-    """sensors.txt → {sensor_id: {fx,fy,cx,cy,w,h}}"""
-    cams = {}
-    for line in open(sensors_txt):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 10 or parts[2] != "camera":
-            continue
-        cams[parts[0]] = {
-            "w": int(parts[4]), "h": int(parts[5]),
-            "fx": float(parts[6]), "fy": float(parts[7]),
-            "cx": float(parts[8]), "cy": float(parts[9]),
-        }
-    return cams
-
-
-def _gs_parse_trajectories(traj_txt):
-    """trajectories.txt → {(ts, dev_id): T_c2w (4×4)}"""
-    poses = {}
-    for line in open(traj_txt):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        p = [x.strip() for x in line.split(",")]
-        if len(p) < 9:
-            continue
-        ts, dev = p[0], p[1]
-        qw, qx, qy, qz = float(p[2]), float(p[3]), float(p[4]), float(p[5])
-        tx, ty, tz      = float(p[6]), float(p[7]), float(p[8])
-        R = np.array([
-            [1-2*(qy**2+qz**2),   2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw)],
-            [  2*(qx*qy+qz*qw), 1-2*(qx**2+qz**2),   2*(qy*qz-qx*qw)],
-            [  2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw), 1-2*(qx**2+qy**2)],
-        ], dtype=np.float64)
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3,  3] = [tx, ty, tz]
-        poses[(ts, dev)] = T
-    return poses
-
-
-def _gs_parse_records(records_txt):
-    """records_camera.txt → [(ts, dev_id, filename)]"""
-    records = []
-    for line in open(records_txt):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        p = [x.strip() for x in line.split(",")]
-        if len(p) >= 3:
-            records.append((p[0], p[1], p[2]))
-    return records
-
-
-def step2_render_gs(ply_path, viewpoints, config, output_dir,
-                    kapture_dir, step0_data=None,
-                    gs_iters=5000, sh_degree=0,
-                    train_img_size=512, subsample=1):
-    """
-    3D Gaussian Splatting 기반 렌더링 (step2_render 의 대안).
-
-    학습:
-      1. aligned PLY → Gaussian 위치/색상 초기화
-      2. kapture 매핑 이미지 + 포즈 → Gaussian 최적화 (gs_iters 회)
-    렌더링:
-      3. grid viewpoints 에서 RGB + metric depth 렌더링
-    출력 형식: step2_render 와 완전히 동일.
-
-    Args:
-        ply_path       : 원본 PLY 경로 (step0_data 있으면 aligned_map.ply 우선)
-        viewpoints     : step1 viewpoints 리스트
-        config         : 설정 dict
-        output_dir     : 출력 디렉토리
-        kapture_dir    : kapture_mapping/sensors 디렉토리
-                         (sensors.txt, trajectories.txt, records_camera.txt, records_data/)
-        step0_data     : step0 결과 (T_align 포함)
-        gs_iters       : Gaussian 최적화 반복 횟수
-        sh_degree      : 구면조화 차수 (0=단순 RGB, 권장)
-        train_img_size : 학습 시 이미지 리사이즈 크기 (픽셀, 정사각형)
-        subsample      : 매핑 이미지 서브샘플 간격
-    """
-    import torch
-    import torch.nn.functional as F
-    try:
-        from gsplat import rasterization
-    except ImportError:
-        raise ImportError("gsplat 미설치: pip install gsplat")
-
-    print("\n" + "="*60 + "\nSTEP 2-GS: 3D Gaussian Splatting Rendering\n" + "="*60)
-
-    # ── 0. 경로/디바이스 설정 ──────────────────────────────────────────
-    if step0_data and "aligned_ply_path" in step0_data:
-        rp = step0_data["aligned_ply_path"]
-    else:
-        rp = os.path.join(output_dir, "aligned_map.ply")
-        if not os.path.exists(rp):
-            rp = ply_path
-    T_align = np.array(step0_data["T_align"], dtype=np.float64) \
-              if step0_data and "T_align" in step0_data else np.eye(4)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  PLY     : {rp}")
-    print(f"  Kapture : {kapture_dir}")
-    print(f"  Device  : {device}  iters={gs_iters}  sh_degree={sh_degree}")
-
-    rd = os.path.join(output_dir, "rendered_gs")
-    gs_ckpt = os.path.join(output_dir, "gaussians.pt")
-    os.makedirs(os.path.join(rd, "rgb"),   exist_ok=True)
-    os.makedirs(os.path.join(rd, "depth"), exist_ok=True)
-
-    # ── 1. PLY 로드 → Gaussian 초기화 ─────────────────────────────────
-    pcd = o3d.io.read_point_cloud(rp)
-    pts = np.asarray(pcd.points, dtype=np.float32)
-    clr = np.asarray(pcd.colors, dtype=np.float32) if pcd.has_colors() \
-          else np.full((len(pts), 3), 0.5, dtype=np.float32)
-    N = len(pts)
-    print(f"  Gaussians: {N} pts")
-
-    # scale 초기화: 인접점 거리 기반
-    from sklearn.neighbors import KDTree as _KDTree
-    sample_pts = pts[np.random.choice(N, min(N, 50000), replace=False)]
-    dists, _ = _KDTree(sample_pts).query(sample_pts, k=4)
-    init_scale = float(np.log(dists[:, 1:].mean() * 0.5 + 1e-6))
-
-    means     = torch.nn.Parameter(torch.from_numpy(pts).to(device))
-    scales    = torch.nn.Parameter(torch.full((N, 3), init_scale, device=device))
-    quats     = torch.nn.Parameter(
-                    torch.cat([torch.ones(N,1), torch.zeros(N,3)], dim=1).to(device))
-    opacities = torch.nn.Parameter(torch.full((N,), -2.0, device=device))
-
-    num_sh = (sh_degree + 1) ** 2
-    SH_C0  = 0.28209479177387814
-    colors_sh = torch.zeros(N, num_sh, 3, device=device)
-    colors_sh[:, 0, :] = torch.from_numpy((clr - 0.5) / SH_C0).to(device)
-    colors_sh = torch.nn.Parameter(colors_sh)
-
-    # ── 2. 학습된 모델이 있으면 로드, 없으면 학습 ─────────────────────
-    if os.path.exists(gs_ckpt):
-        print(f"  [GS] 저장된 모델 로드: {gs_ckpt}")
-        ckpt = torch.load(gs_ckpt, map_location=device)
-        means.data     = ckpt["means"]
-        scales.data    = ckpt["scales"]
-        quats.data     = ckpt["quats"]
-        opacities.data = ckpt["opacities"]
-        colors_sh.data = ckpt["colors_sh"]
-    else:
-        # ── 3. kapture 매핑 데이터 로드 ───────────────────────────────
-        sensors_txt = os.path.join(kapture_dir, "sensors.txt")
-        traj_txt    = os.path.join(kapture_dir, "trajectories.txt")
-        records_txt = os.path.join(kapture_dir, "records_camera.txt")
-        images_root = os.path.join(kapture_dir, "records_data")
-
-        sensor_params = _gs_parse_sensors(sensors_txt)
-        traj          = _gs_parse_trajectories(traj_txt)
-        records       = _gs_parse_records(records_txt)
-        records       = records[::subsample]
-
-        train_data = []
-        for ts, dev, fname in records:
-            key = (ts, dev)
-            if key not in traj:
-                continue
-            if dev not in sensor_params:
-                continue
-            img_path = os.path.join(images_root, fname)
-            if not os.path.exists(img_path):
-                continue
-            # kapture C2W → aligned 좌표계로 변환
-            T_c2w_orig    = traj[key]
-            T_c2w_aligned = T_align @ T_c2w_orig
-            train_data.append({
-                "path": img_path,
-                "T_c2w": T_c2w_aligned.astype(np.float32),
-                "cam": sensor_params[dev],
-            })
-        print(f"  Train frames: {len(train_data)}")
-        if not train_data:
-            raise RuntimeError("학습 이미지를 찾을 수 없습니다. kapture_dir 경로를 확인하세요.")
-
-        # ── 4. 학습 루프 ──────────────────────────────────────────────
-        optimizer = torch.optim.Adam([
-            {"params": means,     "lr": 1.6e-4},
-            {"params": scales,    "lr": 5e-3},
-            {"params": quats,     "lr": 1e-3},
-            {"params": opacities, "lr": 5e-2},
-            {"params": colors_sh, "lr": 2.5e-3},
-        ])
-
-        print(f"  Training {gs_iters} iters ...")
-        for it in range(gs_iters):
-            entry = train_data[it % len(train_data)]
-
-            # GT 이미지 로드 및 리사이즈
-            img_bgr = cv2.imread(entry["path"])
-            if img_bgr is None:
-                continue
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            img_rgb = cv2.resize(img_rgb, (train_img_size, train_img_size))
-            gt = torch.from_numpy(img_rgb.astype(np.float32) / 255.0).to(device)  # (H,W,3)
-
-            cam = entry["cam"]
-            sx  = train_img_size / cam["w"]
-            sy  = train_img_size / cam["h"]
-            fx_t = cam["fx"] * sx
-            fy_t = cam["fy"] * sy
-            cx_t = cam["cx"] * sx
-            cy_t = cam["cy"] * sy
-
-            T_c2w = torch.from_numpy(entry["T_c2w"]).to(device)          # (4,4)
-            viewmat = torch.linalg.inv(T_c2w).unsqueeze(0)               # (1,4,4) W2C
-            K = torch.tensor([[fx_t, 0, cx_t],
-                               [0, fy_t, cy_t],
-                               [0,   0,    1]], device=device).unsqueeze(0).float()  # (1,3,3)
-
-            renders, alphas, _ = rasterization(
-                means=means,
-                quats=F.normalize(quats, dim=-1),
-                scales=torch.exp(scales),
-                opacities=torch.sigmoid(opacities),
-                colors=colors_sh,
-                viewmats=viewmat,
-                Ks=K,
-                width=train_img_size,
-                height=train_img_size,
-                sh_degree=sh_degree,
-                near_plane=0.1,
-                far_plane=100.0,
-            )
-            pred = renders[0, ..., :3].clamp(0, 1)   # (H,W,3)
-
-            loss = F.l1_loss(pred, gt)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            if (it + 1) % 500 == 0:
-                print(f"    iter {it+1}/{gs_iters}  loss={loss.item():.4f}")
-
-        # 모델 저장
-        torch.save({
-            "means":     means.data,
-            "scales":    scales.data,
-            "quats":     quats.data,
-            "opacities": opacities.data,
-            "colors_sh": colors_sh.data,
-        }, gs_ckpt)
-        print(f"  [GS] 모델 저장: {gs_ckpt}")
-
-    # ── 5. grid viewpoints 렌더링 ──────────────────────────────────────
-    cam_cfg = config["camera"]
-    W_out   = cam_cfg["width"]
-    H_out   = cam_cfg["height"]
-    fx_r    = cam_cfg["fx"]
-    fy_r    = cam_cfg["fy"]
-    cx_r    = cam_cfg["cx"]
-    cy_r    = cam_cfg["cy"]
-
-    K_render = torch.tensor([[fx_r, 0, cx_r],
-                              [0, fy_r, cy_r],
-                              [0,   0,    1]], device=device).unsqueeze(0).float()
-
-    rendered = []
-    print(f"  Rendering {len(viewpoints)} viewpoints ...")
-    with torch.no_grad():
-        for i, vp in enumerate(viewpoints):
-            pose    = vp["pose"].astype(np.float32)   # C2W (4×4)
-            viewmat = torch.from_numpy(
-                          np.linalg.inv(pose)).to(device).unsqueeze(0).float()  # (1,4,4)
-
-            renders, alphas, _ = rasterization(
-                means=means,
-                quats=F.normalize(quats, dim=-1),
-                scales=torch.exp(scales),
-                opacities=torch.sigmoid(opacities),
-                colors=colors_sh,
-                viewmats=viewmat,
-                Ks=K_render,
-                width=W_out,
-                height=H_out,
-                sh_degree=sh_degree,
-                near_plane=0.1,
-                far_plane=100.0,
-                render_mode="RGB+D",
-            )
-            # renders: (1, H, W, 4)  마지막 채널 = depth
-            rgb_t   = renders[0, ..., :3].clamp(0, 1)
-            depth_t = renders[0, ...,  3]
-
-            rgb_np   = (rgb_t.cpu().numpy() * 255).astype(np.uint8)
-            depth_np = depth_t.cpu().numpy().astype(np.float32)
-
-            rp_ = os.path.join(rd, "rgb",   f"{vp['id']:06d}.png")
-            dp_ = os.path.join(rd, "depth", f"{vp['id']:06d}.npy")
-            cv2.imwrite(rp_, cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR))
-            np.save(dp_, depth_np)
-
-            rendered.append({
-                "id":         vp["id"],
-                "pose":       vp["pose"],
-                "rgb_path":   rp_,
-                "depth_path": dp_,
-            })
-            if (i + 1) % 100 == 0:
-                print(f"  {i+1}/{len(viewpoints)}")
-
-    # 시각화
-    ns  = min(8, len(rendered))
-    idx = np.linspace(0, len(rendered)-1, ns, dtype=int)
-    fig, ax = plt.subplots(2, ns, figsize=(4*ns, 8))
-    if ns == 1: ax = ax.reshape(2, 1)
-    for c, ii in enumerate(idx):
-        r = rendered[ii]
-        ax[0,c].imshow(cv2.cvtColor(cv2.imread(r["rgb_path"]), cv2.COLOR_BGR2RGB))
-        ax[0,c].set_title(f"GS #{r['id']}", fontsize=9); ax[0,c].axis("off")
-        dv = np.load(r["depth_path"])
-        dv[dv > cam_cfg.get("depth_max", 10)] = 0
-        ax[1,c].imshow(dv, cmap="plasma")
-        ax[1,c].set_title("Depth", fontsize=9); ax[1,c].axis("off")
-    fig.suptitle(f"Step 2-GS: 3DGS Rendered — {len(rendered)} images", fontsize=14)
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "step2_gs_rendered.png"), dpi=150); plt.close()
-    print(f"  Saved: step2_gs_rendered.png")
-
-    pkl_path = os.path.join(output_dir, "step2_gs_data.pkl")
-    pickle.dump(rendered, open(pkl_path, "wb"))
-    print(f"  Saved: {pkl_path}  ({len(rendered)} entries)")
     return rendered
 
 
@@ -2255,8 +1927,7 @@ def run_test_batch(test_dir, db, config, output_dir, gt_poses_path=None):
 # =============================================================================
 # Main
 # =============================================================================
-OFFLINE_STEPS = ["0_align", "1_viewpoints", "2_render", "2_render_gs",
-                 "3_global_desc", "4_build_db"]
+OFFLINE_STEPS = ["0_align", "1_viewpoints", "2_render", "3_global_desc", "4_build_db"]
 ONLINE_STEPS  = ["5_retrieval", "6_match", "6a_match_viz", "7_pnp"]
 STEPS = OFFLINE_STEPS + ONLINE_STEPS
 
@@ -2270,7 +1941,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ply_map",    required=True)
     parser.add_argument("--config",     default="config/render_loc.yaml")
-    parser.add_argument("--output_dir", default="output/gs_test")
+    parser.add_argument("--output_dir", default="output/MegaLoc")
     parser.add_argument("--step",       default="all",
                         choices=["all","offline","online","test"] + STEPS)
     parser.add_argument("--query_image", default=None,
@@ -2281,12 +1952,6 @@ def main():
                         help="배치 테스트용 이미지 디렉토리 또는 단일 파일")
     parser.add_argument("--gt_poses",   default=None,
                         help='GT poses JSON. 형식: {"filename": [[4x4]] or [x,y,z]}')
-    parser.add_argument("--kapture_dir", default="kapture/sensors",
-                        help="2_render_gs 용 kapture_mapping/sensors 디렉토리")
-    parser.add_argument("--gs_iters",   type=int, default=5000,
-                        help="3DGS 학습 반복 횟수 (기본 5000)")
-    parser.add_argument("--gs_subsample", type=int, default=1,
-                        help="매핑 이미지 서브샘플 간격 (기본 1=전체)")
     args = parser.parse_args()
 
     config = load_config(args.config) if os.path.exists(args.config) else default_config()
@@ -2310,19 +1975,6 @@ def main():
 
     if run_offline or args.step == "2_render":
         rendered = step2_render(args.ply_map, vps, config, args.output_dir, s0)
-    elif args.step == "2_render_gs":
-        if not args.kapture_dir:
-            print("ERROR: --kapture_dir 을 지정하세요.")
-            return
-        rendered = step2_render_gs(
-            args.ply_map, vps, config, args.output_dir,
-            kapture_dir=args.kapture_dir,
-            step0_data=s0,
-            gs_iters=args.gs_iters,
-            subsample=args.gs_subsample,
-        )
-        # 이후 step3 이상에서 동일하게 사용할 수 있도록 step2_data.pkl 에도 복사
-        pickle.dump(rendered, open(os.path.join(args.output_dir, "step2_data.pkl"), "wb"))
     else:
         rendered = _load(args.output_dir, "step2_data.pkl") or []
         if not rendered:
