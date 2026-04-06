@@ -41,6 +41,9 @@ def main():
                         help="배치 테스트용 이미지 디렉토리 또는 단일 파일")
     parser.add_argument("--gt_poses",   default=None,
                         help='GT poses JSON. 형식: {"filename": [[4x4]] or [x,y,z]}')
+    parser.add_argument("--save", action="store_true", default=False,
+                        help="--step test 시 각 프레임 중간 이미지 저장 (step5/6/7 png, pkl). "
+                             "미지정 시 trajectory 파일만 저장.")
 
     # Render mode
     parser.add_argument("--render_mode", default="gs",
@@ -156,7 +159,8 @@ def main():
         
         _cam = re.search(r'cam_\d+', os.path.abspath(args.test_dir))
         _cam_sub = _cam.group(0) if _cam else "cam_unknown"
-        run_test_batch(args.test_dir, db, config, args.output_dir, args.gt_poses)
+        run_test_batch(args.test_dir, db, config, args.output_dir, args.gt_poses,
+                       save_images=args.save)
         print(f"\n=== Done === Results in: {args.output_dir}/test_results/{_cam_sub}/")
         return
 

@@ -8,20 +8,22 @@ from .step.step6_match import step6_match
 from .step.step7_pnp import step7_pnp
 
 
-def localize_single(query_image_path, db, config, work_dir):
+def localize_single(query_image_path, db, config, work_dir, save_images=True):
     """단일 쿼리 이미지에 대해 step5→step7 파이프라인 실행."""
     os.makedirs(work_dir, exist_ok=True)
     try:
-        s5 = step5_retrieval(query_image_path, db, config, work_dir)
-        s6 = step6_match(s5, config, work_dir)
-        result = step7_pnp(s6, s5, config, work_dir)
+        s5 = step5_retrieval(query_image_path, db, config, work_dir,
+                             save_images=save_images)
+        s6 = step6_match(s5, config, work_dir, save_images=save_images)
+        result = step7_pnp(s6, s5, config, work_dir, save_images=save_images)
         return result.get("estimated_pose") if result else None
     except Exception as e:
         print(f"    localize_single error: {e}")
         return None
 
 
-def run_test_batch(test_dir, db, config, output_dir, gt_poses_path=None):
+def run_test_batch(test_dir, db, config, output_dir, gt_poses_path=None,
+                   save_images=True):
     """test_dir 안의 모든 이미지에 대해 온라인 파이프라인 실행."""
     from scipy.spatial.transform import Rotation
 
@@ -69,7 +71,8 @@ def run_test_batch(test_dir, db, config, output_dir, gt_poses_path=None):
         work_dir = os.path.join(test_out, os.path.splitext(fname)[0])
         print(f"\n  [{i+1}/{len(img_paths)}] {fname}")
 
-        est_pose = localize_single(img_path, db, config, work_dir)
+        est_pose = localize_single(img_path, db, config, work_dir,
+                                   save_images=save_images)
         est_xyz  = est_pose[:3, 3] if est_pose is not None else None
         gt_xyz   = gt_map.get(fname)
         err      = float(np.linalg.norm(est_xyz - gt_xyz)) \

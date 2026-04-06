@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from .step3_global_desc import _extract_megaloc_desc, _extract_dino_patches, _compute_vlad
 
 
-def step5_retrieval(query_image_path, db, config, output_dir):
+def step5_retrieval(query_image_path, db, config, output_dir, save_images=True):
     """Query 이미지 → global descriptor → KDTree top-K retrieval."""
     import torch
     print("\n" + "="*60 + "\nSTEP 5: Global retrieval\n" + "="*60)
@@ -71,26 +71,27 @@ def step5_retrieval(query_image_path, db, config, output_dir):
             gt_str = f"  GT_dist={d:.2f}m"
         print(f"    Rank{rank+1}: #{cand['id']}  sim={sim:.4f}{gt_str}")
 
-    n_show  = min(top_k, 5) + 1
-    fig, axes = plt.subplots(1, n_show, figsize=(4*n_show, 4))
-    if n_show == 1: axes = [axes]
-    axes[0].imshow(query_rgb)
-    axes[0].set_title("QUERY", color="blue", fontsize=10)
-    axes[0].axis("off")
-    for rank, (cand, sim) in enumerate(zip(candidates[:n_show-1], cos_sims[:n_show-1])):
-        col = "green" if rank == 0 else "orange"
-        ref_rgb = cv2.cvtColor(cv2.imread(cand["rgb_path"]), cv2.COLOR_BGR2RGB)
-        p = np.array(cand["pose"])[:3, 3]
-        axes[rank+1].imshow(ref_rgb)
-        axes[rank+1].set_title(
-            f"Rank{rank+1} #{cand['id']}  sim={sim:.3f}\n"
-            f"({p[0]:.1f},{p[1]:.1f},{p[2]:.1f})",
-            color=col, fontsize=8)
-        axes[rank+1].axis("off")
-    fig.suptitle(f"Step 5: KDTree Retrieval — Top-{top_k}", fontsize=12)
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_dir,"step5_retrieval.png"), dpi=150); plt.close()
-    print(f"  Saved: step5_retrieval.png")
+    if save_images:
+        n_show  = min(top_k, 5) + 1
+        fig, axes = plt.subplots(1, n_show, figsize=(4*n_show, 4))
+        if n_show == 1: axes = [axes]
+        axes[0].imshow(query_rgb)
+        axes[0].set_title("QUERY", color="blue", fontsize=10)
+        axes[0].axis("off")
+        for rank, (cand, sim) in enumerate(zip(candidates[:n_show-1], cos_sims[:n_show-1])):
+            col = "green" if rank == 0 else "orange"
+            ref_rgb = cv2.cvtColor(cv2.imread(cand["rgb_path"]), cv2.COLOR_BGR2RGB)
+            p = np.array(cand["pose"])[:3, 3]
+            axes[rank+1].imshow(ref_rgb)
+            axes[rank+1].set_title(
+                f"Rank{rank+1} #{cand['id']}  sim={sim:.3f}\n"
+                f"({p[0]:.1f},{p[1]:.1f},{p[2]:.1f})",
+                color=col, fontsize=8)
+            axes[rank+1].axis("off")
+        fig.suptitle(f"Step 5: KDTree Retrieval — Top-{top_k}", fontsize=12)
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir,"step5_retrieval.png"), dpi=150); plt.close()
+        print(f"  Saved: step5_retrieval.png")
 
     data = {
         "query_rgb":        query_rgb,
@@ -100,5 +101,6 @@ def step5_retrieval(query_image_path, db, config, output_dir):
         "gt_entry":         gt_entry,
         "query_image_path": query_image_path,
     }
-    pickle.dump(data, open(os.path.join(output_dir,"step5_data.pkl"),"wb"))
+    if save_images:
+        pickle.dump(data, open(os.path.join(output_dir,"step5_data.pkl"),"wb"))
     return data
