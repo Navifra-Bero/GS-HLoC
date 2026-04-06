@@ -539,9 +539,21 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                                     torch.log1p(pred_depth[valid_mask]),
                                     torch.log1p(gt_depth_t[valid_mask]))
 
+                    # ── Scale regularization (needle artifact 방지)
+                    scales_exp = torch.exp(params["scales"])   # (N, 3), 양수
+                    # 1) 최대 scale이 너무 커지면 패널티
+                    scale_max_loss = scales_exp.max(dim=-1).values.mean()
+                    # 2) needle: max_scale / min_scale 비율이 크면 패널티
+                    scale_ratio_loss = (scales_exp.max(dim=-1).values /
+                                        (scales_exp.min(dim=-1).values + 1e-6)).mean()
+
                     # ── Total loss (depth 가중치: 1.0 → 0.1로 linear decay)
                     depth_w = max(0.1, 1.0 - 0.9 * (global_it / total_iters))
-                    loss = (rgb_loss + depth_w * depth_loss) / accum_steps
+                    loss = (rgb_loss
+                            + depth_w * depth_loss
+                            + 1e-4 * scale_max_loss
+                            + 1e-3 * scale_ratio_loss
+                            ) / accum_steps
 
                     # DefaultStrategy: 마지막 sub-step에서 retain_grad
                     if acc == accum_steps - 1:
@@ -561,6 +573,10 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                 for opt in optimizers.values():
                     opt.step()
                 means_scheduler.step()
+
+                # Hard clamp: log-scale [-6, 1] → exp 범위 [~0.002, ~2.7m]
+                with torch.no_grad():
+                    params["scales"].clamp_(-6.0, 1.0)
 
                 epoch_loss += step_loss  # step_loss = sum of (loss / accum) over accum steps
                 epoch_count += 1
