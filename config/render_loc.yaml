@@ -44,6 +44,22 @@ features:
   global_model: "models/netvlad.pt"
   global_desc_dim: 512
   use_gpu: true
+  # ── Matcher 선택 ──────────────────────────────────────────────────────
+  # "eloftr"              : 기존 EfficientLoFTR (third_party/EfficientLoFTR)
+  # vismatch 계열 예시:
+  #   "loftr"             : LoFTR
+  #   "superpoint-lightglue" : SuperPoint + LightGlue
+  #   "disk-lightglue"    : DISK + LightGlue
+  #   "aliked-lightglue"  : ALIKED + LightGlue
+  #   "roma"              : RoMa (dense)
+  #   "xfeat"             : XFeat
+  # vismatch 전체 목록: https://github.com/gmberton/vismatch
+  matcher_name: "eloftr"
+  eloftr_ckpt: ""           # 비워두면 기본 경로 사용
+  eloftr_opt: false         # true = optimized(경량) 모드
+  match_conf_thresh: 0.2    # eloftr 전용 confidence threshold
+  eloftr_max_dim: 840       # 이미지 최대 해상도 (eloftr)
+  vismatch_max_dim: 840     # 이미지 최대 해상도 (vismatch)
 
 matching:
   superglue_model: "models/superglue_indoor.pth"
@@ -52,10 +68,20 @@ matching:
   use_gpu: true
 
 pnp:
+  # ── Solver 선택 ──────────────────────────────────────────────────────
+  # "opencv"      : cv2.solvePnPRansac (EPnP + vanilla RANSAC)
+  # "superansac"  : PROSAC + MAGSAC + GCRANSAC local opt (권장)
+  solver: "opencv"
+  # ── 공통 파라미터 ─────────────────────────────────────────────────────
+  reproj_threshold: 4.0      # inlier threshold (pixels)
+  min_inliers: 6
+  refine: true               # RANSAC 후 inlier만으로 iterative refine
+  # ── OpenCV 전용 ──────────────────────────────────────────────────────
   ransac_iterations: 1000
-  ransac_reproj_threshold: 8.0
-  min_inliers: 15
-  refine_with_ba: true
+  pnp_confidence: 0.99
+  # ── SuperANSAC 전용 ──────────────────────────────────────────────────
+  superansac_max_iterations: 1000
+  superansac_confidence: 0.99
 
 icp:
   enable: false
