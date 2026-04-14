@@ -1,0 +1,3 @@
+[submodule "third_party/scaffold_gs"]
+	path = third_party/scaffold_gs
+	url = https://github.com/city-super/Scaffold-GS.git
