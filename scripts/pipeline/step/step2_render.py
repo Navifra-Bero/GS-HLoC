@@ -280,7 +280,8 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                kapture_dir, step0_data=None,
                gs_epochs=30, sh_degree=0,
                train_img_size=512, subsample=1,
-               voxel_size=None, accum_steps=4):
+               voxel_size=None, accum_steps=4,
+               use_ppisp=False):
     import torch
     import torch.nn.functional as F
     from pytorch_msssim import ssim as _ssim_fn
@@ -380,6 +381,8 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
         records       = _gs_parse_records(records_txt)
         records       = records[::subsample]
 
+        # PPISP용 camera/frame index 매핑
+        cam_id_map = {}   # dev → camera_idx (0-based)
         train_data = []
         for ts, dev, fname in records:
             key = (ts, dev)
@@ -390,14 +393,20 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
             img_path = os.path.join(images_root, fname)
             if not os.path.exists(img_path):
                 continue
+            if dev not in cam_id_map:
+                cam_id_map[dev] = len(cam_id_map)
             T_c2w_orig    = traj[key]
             T_c2w_aligned = T_align @ T_c2w_orig
             train_data.append({
-                "path": img_path,
-                "T_c2w": T_c2w_aligned.astype(np.float32),
-                "cam": sensor_params[dev],
+                "path":       img_path,
+                "T_c2w":      T_c2w_aligned.astype(np.float32),
+                "cam":        sensor_params[dev],
                 "depth_path": depth_map.get(key),
+                "camera_idx": cam_id_map[dev],
+                "frame_idx":  len(train_data),   # 순서대로 고유 frame_idx
             })
+        num_cameras = len(cam_id_map)
+        num_frames  = len(train_data)
         print(f"  Train frames: {len(train_data)}  "
               f"(with depth: {sum(1 for d in train_data if d['depth_path'])})")
         if not train_data:
@@ -420,6 +429,32 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
             "colors_sh": torch.optim.Adam([colors_sh], lr=2.5e-3),
         }
 
+        # ── PPISP 초기화 (4대 카메라, 노출 차이 보정)
+        ppisp_module = None
+        ppisp_opt = None
+        ppisp_sched = None
+        if use_ppisp:
+            try:
+                from ppisp import PPISP, PPISPConfig
+                ppisp_cfg = PPISPConfig(
+                    use_controller=True,
+                    controller_distillation=True,
+                    controller_activation_ratio=0.8,
+                )
+                ppisp_module = PPISP(
+                    num_cameras=num_cameras,
+                    num_frames=num_frames,
+                    config=ppisp_cfg,
+                ).to(device)
+                ppisp_opt, ppisp_sched = ppisp_module.create_optimizers(), None
+                try:
+                    ppisp_sched = ppisp_module.create_schedulers(ppisp_opt)
+                except Exception:
+                    pass
+                print(f"  [PPISP] 초기화: {num_cameras} cameras, {num_frames} frames")
+            except ImportError:
+                print("  [PPISP] 미설치 — ppisp 없이 진행")
+
         # epoch/iter 계산
         iters_per_epoch = len(train_data) // accum_steps
         total_iters = gs_epochs * iters_per_epoch
@@ -437,7 +472,7 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
             refine_stop_iter=int(total_iters * 0.75),
             refine_every=max(1, iters_per_epoch // 5),
             reset_every=iters_per_epoch * 3,
-            prune_opa=0.005,
+            prune_opa=0.01,
             prune_scale3d=0.1,
         )
         state = strategy.initialize_state(scene_scale=scene_scale)
@@ -464,6 +499,9 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
             for step in pbar:
                 for opt in optimizers.values():
                     opt.zero_grad()
+                if ppisp_opt:
+                    for opt in (ppisp_opt if isinstance(ppisp_opt, list) else [ppisp_opt]):
+                        opt.zero_grad()
 
                 last_info = None
                 step_loss = 0.0
@@ -517,6 +555,21 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                     pred = renders[0, ..., :3].clamp(0, 1)
                     pred_depth = renders[0, ..., 3]     # (H, W)
 
+                    # ── PPISP: 렌더링 후 photometric 보정
+                    if ppisp_module is not None:
+                        # pixel_coords: (H, W, 2) normalized [-1, 1]
+                        ys = torch.linspace(-1, 1, new_h, device=device)
+                        xs = torch.linspace(-1, 1, new_w, device=device)
+                        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+                        pixel_coords = torch.stack([grid_x, grid_y], dim=-1)  # (H, W, 2)
+                        pred = ppisp_module(
+                            rgb=pred,
+                            pixel_coords=pixel_coords,
+                            resolution=(new_w, new_h),
+                            camera_idx=entry["camera_idx"],
+                            frame_idx=entry["frame_idx"],
+                        ).clamp(0, 1)
+
                     # ── RGB loss: L1 + SSIM
                     l1_loss = F.l1_loss(pred, gt)
                     pred_bchw = pred.permute(2, 0, 1).unsqueeze(0)
@@ -547,12 +600,17 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                     scale_ratio_loss = (scales_exp.max(dim=-1).values /
                                         (scales_exp.min(dim=-1).values + 1e-6)).mean()
 
+                    # ── PPISP regularization loss
+                    ppisp_reg = (ppisp_module.get_regularization_loss()
+                                 if ppisp_module is not None else 0.0)
+
                     # ── Total loss (depth 가중치: 1.0 → 0.1로 linear decay)
                     depth_w = max(0.1, 1.0 - 0.9 * (global_it / total_iters))
                     loss = (rgb_loss
                             + depth_w * depth_loss
                             + 1e-4 * scale_max_loss
                             + 1e-3 * scale_ratio_loss
+                            + ppisp_reg
                             ) / accum_steps
 
                     # DefaultStrategy: 마지막 sub-step에서 retain_grad
@@ -573,10 +631,17 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                 for opt in optimizers.values():
                     opt.step()
                 means_scheduler.step()
+                if ppisp_opt:
+                    for opt in (ppisp_opt if isinstance(ppisp_opt, list) else [ppisp_opt]):
+                        opt.step()
+                if ppisp_sched:
+                    for sched in (ppisp_sched if isinstance(ppisp_sched, list) else [ppisp_sched]):
+                        sched.step()
 
-                # Hard clamp: log-scale [-6, 1] → exp 범위 [~0.002, ~2.7m]
+                # Hard clamp: log-scale [-6, 0] → exp 범위 [~0.002, ~1.0m]
+                # 실내 주차장 기준 1m 이상 Gaussian은 near-field streak 원인
                 with torch.no_grad():
-                    params["scales"].clamp_(-6.0, 1.0)
+                    params["scales"].clamp_(-6.0, 0.0)
 
                 epoch_loss += step_loss  # step_loss = sum of (loss / accum) over accum steps
                 epoch_count += 1
@@ -658,14 +723,18 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
         colors_sh = params["colors_sh"]
 
         # 최종 모델도 기존 위치에 저장 (호환성)
-        torch.save({
+        ckpt_dict = {
             "means":     means.data,
             "scales":    scales.data,
             "quats":     quats.data,
             "opacities": opacities.data,
             "colors_sh": colors_sh.data,
-        }, gs_ckpt)
-        print(f"  [GS] 최종 모델 저장: {gs_ckpt}  ({len(means):,} GS)")
+        }
+        if ppisp_module is not None:
+            ckpt_dict["ppisp"] = ppisp_module.state_dict()
+        torch.save(ckpt_dict, gs_ckpt)
+        print(f"  [GS] 최종 모델 저장: {gs_ckpt}  ({len(means):,} GS)"
+              + ("  [+PPISP]" if ppisp_module else ""))
 
         # 최종 가우시안 맵을 PLY로 저장
         SH_C0 = 0.28209479177387814
@@ -825,7 +894,8 @@ def step2_render(ply_path, viewpoints, config, output_dir,
 
     Args:
         mode: "pointcloud" (O3D split-render) or "gs" (3D Gaussian Splatting)
-        **kwargs: GS-specific params (kapture_dir, gs_epochs, voxel_size, accum_steps, etc.)
+        **kwargs: GS-specific params (kapture_dir, gs_epochs, voxel_size, accum_steps,
+                  use_ppisp, etc.)
     """
     if mode == "gs":
         return _render_gs(ply_path, viewpoints, config, output_dir,
