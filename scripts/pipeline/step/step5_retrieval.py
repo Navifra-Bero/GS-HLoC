@@ -4,7 +4,10 @@ import cv2
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from .step3_global_desc import _extract_megaloc_desc, _extract_dino_patches, _compute_vlad
+from .step3_global_desc import (_extract_megaloc_desc, _extract_megaloc_spatial,
+                                _extract_mixvpr_desc, _extract_mixvpr_spatial,
+                                _extract_depth_spatial, _load_query_depth,
+                                _load_mixvpr_model)
 
 
 def step5_retrieval(query_image_path, db, config, output_dir, save_images=True):
@@ -12,8 +15,7 @@ def step5_retrieval(query_image_path, db, config, output_dir, save_images=True):
     import torch
     print("\n" + "="*60 + "\nSTEP 5: Global retrieval\n" + "="*60)
     fc    = config["features"]
-    onl   = config.get("online", {})
-    top_k = onl.get("top_k", 5)
+    top_k = config.get("matching", {}).get("top_k_retrieval", 10)
     dev   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if query_image_path and os.path.exists(query_image_path):
@@ -27,40 +29,112 @@ def step5_retrieval(query_image_path, db, config, output_dir, save_images=True):
         print(f"  Query: DB entry #{gt_entry['id']} (self-test)")
 
     _cache = step5_retrieval.__dict__
-    global_desc_method = db.get("global_desc_method", "anyloc")
+    global_desc_method = db.get("global_desc_method", "megaloc")
 
+    # ── 공통 파라미터 ──────────────────────────────────────────────────────
+    use_depth        = bool(fc.get("use_depth_desc", False))
+    n_bins           = int(fc.get("depth_bins", 32))
+    w_rgb            = float(fc.get("depth_rgb_weight", 0.7))
+    w_depth          = 1.0 - w_rgb
+    cam_h            = int(config.get("camera", {}).get("height", 1200))
+    cam_w            = int(config.get("camera", {}).get("width", 1920))
+    retrieval_factor = int(config.get("matching", {}).get("retrieval_factor", 3))
+    expand_k         = top_k * retrieval_factor
+    q_depth_desc     = None
+
+    # ── MegaLoc 분기 ──────────────────────────────────────────────────────
     if global_desc_method == "megaloc":
-        print(f"  Method: MegaLoc  (dim={fc.get('megaloc_dim', 8448)})")
+        grid_n      = int(fc.get("dino_grid_n", db["entries"][0].get("dino_grid_n", 1)
+                                 if db["entries"] else 1))
+        use_spatial = grid_n > 1
+        depth_grid  = grid_n if use_spatial else 1
+
+        parts = []
+        if use_spatial: parts.append(f"{grid_n}×{grid_n} grid")
+        if use_depth:   parts.append(f"depth late-fusion w={w_rgb:.1f}/{w_depth:.1f}")
+        print(f"  Method: MegaLoc" + (f" ({', '.join(parts)})" if parts else ""))
+
         if "_megaloc_model" not in _cache:
             print("  Loading MegaLoc …")
             model = torch.hub.load("gmberton/MegaLoc", "get_trained_model")
             model.eval().to(dev)
             _cache["_megaloc_model"] = model
         model = _cache["_megaloc_model"]
-        q_gd_norm = _extract_megaloc_desc(query_rgb, model, dev)
-        q_gd_norm = q_gd_norm / (np.linalg.norm(q_gd_norm) + 1e-8)
-    else:
-        vlad_centers = db.get("vlad_centers")
-        if vlad_centers is None:
-            raise RuntimeError("DB에 vlad_centers가 없습니다. step3→step4를 재실행하세요.")
-        dino_name  = fc.get("dino_model", "dinov2_vitb14")
-        img_size   = int(fc.get("dino_img_size", 322))
-        n_clusters = vlad_centers.shape[0]
-        feat_dim   = vlad_centers.shape[1]
-        print(f"  Method: AnyLoc  DINOv2={dino_name}  VLAD K={n_clusters}  dim={n_clusters*feat_dim}")
-        if "_dino_model" not in _cache or _cache.get("_dino_name") != dino_name:
-            model = torch.hub.load("facebookresearch/dinov2", dino_name, pretrained=True)
-            model.eval().to(dev)
-            _cache["_dino_model"] = model
-            _cache["_dino_name"]  = dino_name
-            print(f"  Loaded DINOv2: {dino_name}")
-        model = _cache["_dino_model"]
-        q_patches = _extract_dino_patches(query_rgb, model, dev, img_size)
-        q_gd_norm = _compute_vlad(q_patches, vlad_centers)
 
-    dists, idxs = db["kdtree"].query(q_gd_norm, k=top_k)
-    cos_sims    = 1.0 - dists**2 / 2.0
-    candidates  = [db["entries"][i] for i in idxs]
+        q_gd_norm = (_extract_megaloc_spatial(query_rgb, model, dev, grid_n)
+                     if use_spatial else _extract_megaloc_desc(query_rgb, model, dev))
+
+        if use_depth and query_image_path:
+            depth_map, depth_path = _load_query_depth(query_image_path, cam_h, cam_w)
+            if depth_map is not None:
+                q_depth_desc = _extract_depth_spatial(depth_map, depth_grid, n_bins)
+                print(f"  Query depth loaded: {depth_path}")
+            else:
+                print(f"  WARNING: depth not found ({depth_path}), RGB-only")
+
+    # ── MixVPR 분기 ───────────────────────────────────────────────────────
+    elif global_desc_method == "mixvpr":
+        ckpt_path   = fc.get("mixvpr_ckpt", "")
+        out_dim     = int(fc.get("mixvpr_out_dim", 512))
+        grid_n      = int(fc.get("grid_n", db["entries"][0].get("grid_n", 1)
+                                  if db["entries"] else 1))
+        use_spatial = grid_n > 1
+        depth_grid  = grid_n if use_spatial else 1
+
+        parts = []
+        if use_spatial: parts.append(f"{grid_n}×{grid_n} grid")
+        if use_depth:   parts.append(f"depth late-fusion w={w_rgb:.1f}/{w_depth:.1f}")
+        print(f"  Method: MixVPR (out_dim={out_dim})" +
+              (f" ({', '.join(parts)})" if parts else ""))
+
+        if ("_mixvpr_model" not in _cache
+                or _cache.get("_mixvpr_ckpt") != ckpt_path
+                or _cache.get("_mixvpr_out_dim") != out_dim):
+            model = _load_mixvpr_model(ckpt_path, out_dim, dev)
+            _cache["_mixvpr_model"]   = model
+            _cache["_mixvpr_ckpt"]    = ckpt_path
+            _cache["_mixvpr_out_dim"] = out_dim
+        model = _cache["_mixvpr_model"]
+
+        q_gd_norm = (_extract_mixvpr_spatial(query_rgb, model, dev, grid_n)
+                     if use_spatial else _extract_mixvpr_desc(query_rgb, model, dev))
+
+        if use_depth and query_image_path:
+            depth_map, depth_path = _load_query_depth(query_image_path, cam_h, cam_w)
+            if depth_map is not None:
+                q_depth_desc = _extract_depth_spatial(depth_map, depth_grid, n_bins)
+                print(f"  Query depth loaded: {depth_path}")
+            else:
+                print(f"  WARNING: depth not found ({depth_path}), RGB-only")
+
+    else:
+        raise ValueError(f"Unknown global_desc_method in DB: '{global_desc_method}'. "
+                         "Re-run step3 with a supported method (megaloc, mixvpr).")
+
+    # ── Step 1: RGB KDTree로 expand_k개 후보 추출 ────────────────────────
+    actual_expand_k = min(expand_k, len(db["entries"]))
+    dists, idxs = db["kdtree"].query(q_gd_norm, k=actual_expand_k)
+    rgb_sims    = 1.0 - dists ** 2 / 2.0   # L2 dist → cosine sim
+
+    # ── Step 2: depth late fusion re-ranking ─────────────────────────────
+    depth_descs_db = db.get("depth_descs")
+    if (q_depth_desc is not None and depth_descs_db is not None
+            and db.get("has_depth", True)):
+        cand_depth = depth_descs_db[idxs]
+        depth_sims = cand_depth @ q_depth_desc
+        final_sims = w_rgb * rgb_sims + w_depth * depth_sims
+        print(f"  Late fusion: {actual_expand_k} candidates → "
+              f"re-rank (w_rgb={w_rgb:.1f}, w_depth={w_depth:.1f})")
+    else:
+        final_sims = rgb_sims
+        if use_depth:
+            print("  Late fusion: depth 없음, RGB-only 사용")
+
+    # ── Step 3: 최종 top_k 선택 ──────────────────────────────────────────
+    order      = np.argsort(-final_sims)[:top_k]
+    top_idxs   = idxs[order]
+    cos_sims   = final_sims[order]
+    candidates = [db["entries"][i] for i in top_idxs]
 
     print(f"  Top-{top_k} results:")
     for rank, (cand, sim) in enumerate(zip(candidates, cos_sims)):
@@ -91,7 +165,7 @@ def step5_retrieval(query_image_path, db, config, output_dir, save_images=True):
         fig.suptitle(f"Step 5: KDTree Retrieval — Top-{top_k}", fontsize=12)
         fig.tight_layout()
         fig.savefig(os.path.join(output_dir,"step5_retrieval.png"), dpi=150); plt.close()
-        print(f"  Saved: step5_retrieval.png")
+        print("  Saved: step5_retrieval.png")
 
     data = {
         "query_rgb":        query_rgb,

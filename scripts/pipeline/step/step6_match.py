@@ -4,7 +4,8 @@ import cv2
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from .step3_global_desc import _extract_megaloc_desc, _extract_dino_patches, _compute_vlad
+from .step3_global_desc import (_extract_megaloc_desc,
+                                _extract_mixvpr_desc, _load_mixvpr_model)
 
 
 # ── EfficientLoFTR helpers ─────────────────────────────────────────────────
@@ -94,20 +95,22 @@ def _run_vismatch(matcher, query_rgb, ref_rgb, max_dim):
         confs : (M,) uniform 1.0 (vismatch는 per-match confidence 미제공)
         n_good: matched pair 수
         score : re-ranking 점수 (= n_good, confidence 없으므로)
+
+    NOTE: vismatch load_image(resize=int) resizes to a square (int × int).
+    We must pass a (H, W) tuple with aspect-preserving dimensions so that the
+    scale-back to original coords is correct.
     """
-    def _compute_scale(orig_h, orig_w, max_d):
-        """원본→resize 스케일 계산. max_d=None이면 스케일 없음."""
+    def _aspect_resize_dims(orig_h, orig_w, max_d):
+        """longest-edge resize → new (H, W). max_d=None → 원본 크기 유지."""
         if max_d is None or max(orig_h, orig_w) <= max_d:
-            return 1.0, 1.0
+            return orig_h, orig_w
         s = max_d / max(orig_h, orig_w)
-        resized_h = int(orig_h * s)
-        resized_w = int(orig_w * s)
-        return orig_w / resized_w, orig_h / resized_h  # scale_x, scale_y (resize→orig)
+        return int(orig_h * s), int(orig_w * s)
 
     q_h, q_w = query_rgb.shape[:2]
     r_h, r_w = ref_rgb.shape[:2]
-    q_sx, q_sy = _compute_scale(q_h, q_w, max_dim)
-    r_sx, r_sy = _compute_scale(r_h, r_w, max_dim)
+    q_new_h, q_new_w = _aspect_resize_dims(q_h, q_w, max_dim)
+    r_new_h, r_new_w = _aspect_resize_dims(r_h, r_w, max_dim)
 
     import io
     from PIL import Image as _PILImage
@@ -118,9 +121,9 @@ def _run_vismatch(matcher, query_rgb, ref_rgb, max_dim):
         buf.seek(0)
         return buf
 
-    resize_arg = max_dim
-    img0 = matcher.load_image(_to_bytes(query_rgb), resize=resize_arg)
-    img1 = matcher.load_image(_to_bytes(ref_rgb),   resize=resize_arg)
+    # resize 인수를 (H, W) 튜플로 전달 → 비율 유지 리사이즈
+    img0 = matcher.load_image(_to_bytes(query_rgb), resize=(q_new_h, q_new_w))
+    img1 = matcher.load_image(_to_bytes(ref_rgb),   resize=(r_new_h, r_new_w))
 
     result = matcher(img0, img1)
 
@@ -130,7 +133,12 @@ def _run_vismatch(matcher, query_rgb, ref_rgb, max_dim):
     if len(mkpts0) == 0:
         return np.zeros((0, 2)), np.zeros((0, 2)), np.array([]), 0, 0.0
 
-    # resize 좌표 → 원본 좌표
+    # resize 좌표 → 원본 좌표 (aspect-preserving scale)
+    q_sx = q_w / q_new_w if q_new_w > 0 else 1.0
+    q_sy = q_h / q_new_h if q_new_h > 0 else 1.0
+    r_sx = r_w / r_new_w if r_new_w > 0 else 1.0
+    r_sy = r_h / r_new_h if r_new_h > 0 else 1.0
+
     mkpts0 = mkpts0 * np.array([q_sx, q_sy], dtype=np.float32)
     mkpts1 = mkpts1 * np.array([r_sx, r_sy], dtype=np.float32)
 
@@ -472,17 +480,16 @@ def step6a_match_viz(query_dir, db, config, output_dir):
         # ── Retrieval ──────────────────────────────────────────────────
         if global_desc_method == "megaloc":
             q_gd = _extract_megaloc_desc(query_rgb, retr_model, dev)
-        else:
-            vlad_centers = db.get("vlad_centers")
-            img_size  = int(fc.get("dino_img_size", 322))
-            dino_name = fc.get("dino_model", "dinov2_vitb14")
+        elif global_desc_method == "mixvpr":
             from .step5_retrieval import step5_retrieval
-            if "_dino_model" not in step5_retrieval.__dict__:
-                step5_retrieval.__dict__["_dino_model"] = torch.hub.load(
-                    "facebookresearch/dinov2", dino_name).eval().to(dev)
-            dino = step5_retrieval.__dict__["_dino_model"]
-            q_patches = _extract_dino_patches(query_rgb, dino, dev, img_size)
-            q_gd = _compute_vlad(q_patches, vlad_centers)
+            _sc = step5_retrieval.__dict__
+            if "_mixvpr_model" not in _sc:
+                ckpt_path = fc.get("mixvpr_ckpt", "")
+                out_dim   = int(fc.get("mixvpr_out_dim", 512))
+                _sc["_mixvpr_model"] = _load_mixvpr_model(ckpt_path, out_dim, dev)
+            q_gd = _extract_mixvpr_desc(query_rgb, _sc["_mixvpr_model"], dev)
+        else:
+            raise ValueError(f"Unknown global_desc_method: '{global_desc_method}'")
 
         q_gd = q_gd / (np.linalg.norm(q_gd) + 1e-8)
         dists, idxs = db["kdtree"].query(q_gd, k=top_k)
