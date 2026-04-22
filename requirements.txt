@@ -16,9 +16,18 @@ matplotlib>=3.5.0
 scipy>=1.7.0
 scikit-learn>=1.0.0   # PCA for step 4
 
-# Optional: better global descriptors
-# eigenplaces
-# pytorch-NetVlad
+# MixVPR dependencies (third_party/MixVPR 필요)
+timm>=0.6.12
 
 gsplat
 scikit-image
+
+
+# DeDoDe + LightGlue matcher (step6_match_dedode)
+# pip install git+https://github.com/cvg/LightGlue.git
+
+# vismatch를 사용하기 위해서 third_party/vismatch에 들어가서
+# pip install .
+# pip install romatch
+# 이거 설치하고 나면 numpy나 다른거 에러가 뜰 것이다. 이때 pip install --force-reinstall scikit-learn 이거로 맞춰주고
+# pip install numpy==1.26.3 과 같이 1 버전으로 다시 넘파이를 설치한다.

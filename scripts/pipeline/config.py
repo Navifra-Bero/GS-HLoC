@@ -28,24 +28,25 @@ def default_config():
         #     "depth_scale": 1000, "depth_min": 0.3, "depth_max": 20.0,
         # },
         # #cam_3
-        # "camera": {
-        #     "fx": 1039.04598063, "fy": 1041.49694151, "cx": 937.04407689, "cy": 560.82673816,
-        #     "width": 1920, "height": 1080,
-        #     "depth_scale": 1000, "depth_min": 0.3, "depth_max": 20.0,
-        #femto
         "camera": {
-            "fx": 2256.627197, "fy": 2254.400635, "cx": 1891.352783, "cy": 1087.097656,
-            "width": 3840, "height": 2160,
+            "fx": 1039.04598063, "fy": 1041.49694151, "cx": 937.04407689, "cy": 560.82673816,
+            "width": 1920, "height": 1080,
             "depth_scale": 1000, "depth_min": 0.3, "depth_max": 20.0,
         },
+        #femto
+        # "camera": {
+        #     "fx": 2256.627197, "fy": 2254.400635, "cx": 1891.352783, "cy": 1087.097656,
+        #     "width": 3840, "height": 2160,
+        #     "depth_scale": 1000, "depth_min": 0.3, "depth_max": 20.0,
+        # },
         "alignment": {
             "normal_threshold": 0.8, "ransac_distance": 0.05,
             "ransac_n": 3, "ransac_iterations": 1000, "pre_flip_x": False,
         },
         "sampling": {
             "grid_resolution": 0.05, "path_spacing": 0.3,
-            "height_above_floor": 1.2, "num_yaw_angles": 4,
-            "pitch_deg": 0.0, "morph_kernel_size": 5,
+            "height_above_floor": 1.93, "num_yaw_angles": 4,
+            "pitch_angles_deg": [0.0], "morph_kernel_size": 5,
             "distance_thresh_ratio": 0.3, "min_floor_points": 100,
             "max_floors": 1, "min_floor_gap": 2.5,
             "max_floor_height": 5.0, "floor_band": 0.3,
