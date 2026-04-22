@@ -88,8 +88,11 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
     gr = samp.get("grid_resolution", 0.05)
     ps = samp.get("path_spacing", 0.5)
     ch = samp.get("height_above_floor", 1.2)
-    ny = samp.get("num_yaw_angles", 6)
-    pitch = np.radians(samp.get("pitch_deg", 0.0))
+    ny = samp.get("num_yaw_angles", 4)
+    # height_offsets_m: 기준 높이(ch)에서의 오프셋 목록 (미터)
+    # e.g. [0.0, -0.2, 0.2] → 기준 / 20cm 아래 / 20cm 위
+    height_offsets = list(samp.get("height_offsets_m", [0.0, -0.2, 0.2]))
+    print(f"  Height offsets: {height_offsets} m")
     mk = samp.get("morph_kernel_size", 5)
     dr = samp.get("distance_thresh_ratio", 0.3)
     sample_mode = samp.get("sample_mode", "skeleton")   # "skeleton" or "grid"
@@ -166,7 +169,7 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
                 sel_xy.append(pos)
         print(f"    Sampled: {len(sel)} positions (mode={sample_mode}, spacing={ps}m)")
 
-        cz = fz + ch
+        base_z = fz + ch
         for si in sel:
             for yi in range(ny):
                 yaw = 2*np.pi*yi/ny
@@ -174,17 +177,14 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
                 up = np.array([0.0, 0.0, 1.0])
                 right = np.cross(forward, up)
                 right = right / np.linalg.norm(right)
-                R_cam = np.column_stack([right, -up, forward])
-                if abs(pitch) > 1e-6:
-                    Rx = np.array([[1,0,0],
-                                   [0,np.cos(pitch),-np.sin(pitch)],
-                                   [0,np.sin(pitch), np.cos(pitch)]])
-                    R_cam = R_cam @ Rx
-                T = np.eye(4)
-                T[:3,:3] = R_cam
-                T[:3,3] = [swx[si], swy[si], cz]
-                all_vp.append({"id": vid, "pose": T, "floor": fi, "yaw": yaw})
-                vid += 1
+                R_cam = np.column_stack([right, -up, forward])  # pitch=0 고정
+                for dz in height_offsets:
+                    T = np.eye(4)
+                    T[:3, :3] = R_cam
+                    T[:3, 3]  = [swx[si], swy[si], base_z + dz]
+                    all_vp.append({"id": vid, "pose": T, "floor": fi,
+                                   "yaw": yaw, "height_offset_m": dz})
+                    vid += 1
 
         debug_imgs[fi] = {
             "occupancy": occ, "closed": closed, "dist_map": dm, "corridor": cb,
@@ -192,7 +192,10 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
             "xn": xn, "yn": yn, "gr": gr, "fz": fz,
         }
 
-    print(f"\n  Total viewpoints: {len(all_vp)}")
+    n_heights = len(height_offsets)
+    n_views_per_pos = ny * n_heights
+    print(f"\n  Total viewpoints: {len(all_vp)}  "
+          f"(yaw×height = {ny}×{n_heights}, height_offsets={height_offsets} m)")
 
     nf = len(debug_imgs)
     if nf > 0:
@@ -223,7 +226,9 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
                 axes[r,ci].set_title(titles[ci], fontsize=9)
                 axes[r,ci].set_xticks([]); axes[r,ci].set_yticks([])
             axes[r,0].set_ylabel(f"Floor {fi}\nz={dbg['fz']:.2f}m", fontsize=11, fontweight="bold")
-        fig.suptitle(f"Step 1: Free Path Corridor — {len(all_vp)} viewpoints", fontsize=14)
+        offset_str = "/".join(f"{dz:+.2f}m" for dz in height_offsets)
+        fig.suptitle(f"Step 1: Free Path Corridor — {len(all_vp)} viewpoints  "
+                     f"(yaw×height = {ny}×{n_heights}, offsets={offset_str})", fontsize=14)
         fig.tight_layout()
         fig.savefig(os.path.join(output_dir, "step1_viewpoints.png"), dpi=150); plt.close()
 
@@ -232,14 +237,17 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
     ax2[0].scatter(points[::sub,0],points[::sub,1],c=points[::sub,2],s=0.3,cmap="viridis",alpha=0.3)
     vpp = np.array([v["pose"][:3,3] for v in all_vp])
     if len(vpp)>0:
-        up_vp = vpp[::ny]
+        # 포지션당 n_views_per_pos 개 뷰 → 첫 번째만 추출해서 위치 표시
+        up_vp = vpp[::n_views_per_pos]
         ax2[0].scatter(up_vp[:,0],up_vp[:,1],c="red",s=15,marker="x",label=f"{len(up_vp)} pos")
     ax2[0].set_title("Top-down: map + viewpoints"); ax2[0].set_aspect("equal"); ax2[0].legend()
     ax2[1].scatter(points[::sub,0],points[::sub,2],c="gray",s=0.3,alpha=0.3)
-    if len(vpp)>0: ax2[1].scatter(vpp[::ny,0],vpp[::ny,2],c="red",s=15,marker="x")
+    if len(vpp)>0: ax2[1].scatter(vpp[::n_views_per_pos,0],vpp[::n_views_per_pos,2],c="red",s=15,marker="x")
     for fz in floors:
-        ax2[1].axhline(y=fz,   color="green", ls="--", alpha=0.5)
-        ax2[1].axhline(y=fz+ch,color="blue",  ls="--", alpha=0.5)
+        ax2[1].axhline(y=fz, color="green", ls="--", alpha=0.5, label="floor")
+        for dz in height_offsets:
+            ax2[1].axhline(y=fz+ch+dz, color="blue", ls="--", alpha=0.4,
+                           label=f"cam {dz:+.2f}m")
     ax2[1].set_title("Side view"); fig2.tight_layout()
     fig2.savefig(os.path.join(output_dir, "step1_viewpoints_3d.png"), dpi=150); plt.close()
     print(f"  Saved: step1_viewpoints.png, step1_viewpoints_3d.png")

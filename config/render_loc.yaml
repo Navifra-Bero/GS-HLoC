@@ -25,7 +25,9 @@ sampling:
   max_floors: 1          # 단일층 강제
   min_floor_gap: 2.5     # 2.5m 이내 peak 병합
   max_floor_height: 5.0  # 5m 이상 무시
-  floor_band: 0.3   
+  floor_band: 0.3
+  num_yaw_angles: 6
+  height_offsets_m: [0.0, 1.5]   # 기준높이 / 20cm 아래 / 20cm 위 → 4×3=12 views/pos
 
 rendering:
   inpaint_background: true  # 활성화
@@ -44,6 +46,18 @@ features:
   global_model: "models/netvlad.pt"
   global_desc_dim: 512
   use_gpu: true
+  # ── Global descriptor method ─────────────────────────────────────────
+  # "megaloc" : MegaLoc 8448-dim (실외 도시 학습, 실내 splat 도메인 갭 있음)
+  # "mixvpr"  : MixVPR ResNet50 기반 (512/128/4096-dim, 권장)
+  #             사전 준비: git clone https://github.com/amaralibey/MixVPR third_party/MixVPR
+  global_desc_method: "mixvpr"
+  # ── MixVPR 설정 ──────────────────────────────────────────────────────
+  mixvpr_ckpt: "models/mixvpr_resnet50_4096.ckpt"  # ResNet50 4096-dim, GSV-Cities trained
+  mixvpr_out_dim: 4096          # 128 / 512 / 4096
+  grid_n: 1                     # 수직 스트립 수 (1=global only, 2=좌+우, 3=좌+중+우) → dim=(1+N)×out_dim
+  use_depth_desc: false         # depth histogram descriptor 추가 여부
+  depth_bins: 32                # depth 히스토그램 bin 수
+  depth_rgb_weight: 0.7         # RGB 가중치 (depth = 1 - 이 값)
   # ── Matcher 선택 ──────────────────────────────────────────────────────
   # "eloftr"              : 기존 EfficientLoFTR (third_party/EfficientLoFTR)
   # vismatch 계열 예시:
@@ -54,7 +68,8 @@ features:
   #   "roma"              : RoMa (dense)
   #   "xfeat"             : XFeat
   # vismatch 전체 목록: https://github.com/gmberton/vismatch
-  matcher_name: "eloftr"
+  # matcher_name: "xfeat"
+  matcher_name : "eloftr"
   eloftr_ckpt: ""           # 비워두면 기본 경로 사용
   eloftr_opt: false         # true = optimized(경량) 모드
   match_conf_thresh: 0.2    # eloftr 전용 confidence threshold
@@ -64,7 +79,8 @@ features:
 matching:
   superglue_model: "models/superglue_indoor.pth"
   match_threshold: 0.2
-  top_k_retrieval: 5
+  retrieval_factor: 3   # depth re-ranking용 초기 후보 배수 (top_k × factor개 RGB 검색 후 재정렬)
+  top_k_retrieval: 5   # 도메인 갭(real photo↔splat render) 보정용으로 크게 설정
   use_gpu: true
 
 pnp:
