@@ -149,6 +149,243 @@ def _run_vismatch(matcher, query_rgb, ref_rgb, max_dim):
     return mkpts0, mkpts1, confs, n_good, score
 
 
+# ── LoFTR (kornia) direct helper ──────────────────────────────────────────
+
+def _load_loftr(config, dev):
+    """kornia LoFTR 직접 로드. indoor/outdoor 선택 가능."""
+    from kornia.feature import LoFTR
+
+    fc = config["features"]
+    variant = fc.get("loftr_variant", "indoor").strip().lower()  # "indoor" | "outdoor"
+    matcher = LoFTR(pretrained=variant).eval().to(dev)
+    return matcher, variant
+
+
+def _make_loftr_gray_tensor_fn(dev, max_dim):
+    """LoFTR용 grayscale tensor 전처리. EfficientLoFTR과 동일한 방식."""
+    import torch
+
+    def to_gray_tensor(rgb_img):
+        gray = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        orig_h, orig_w = gray.shape
+        h, w = orig_h, orig_w
+        if max(h, w) > max_dim:
+            s = max_dim / max(h, w)
+            nw, nh = int(w * s), int(h * s)
+            gray = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
+            h, w = gray.shape
+        scale_x = orig_w / w
+        scale_y = orig_h / h
+        ph = ((h + 7) // 8) * 8
+        pw = ((w + 7) // 8) * 8
+        if ph != h or pw != w:
+            padded = np.zeros((ph, pw), dtype=np.float32)
+            padded[:h, :w] = gray
+            gray = padded
+        return torch.from_numpy(gray).unsqueeze(0).unsqueeze(0).to(dev), scale_x, scale_y
+
+    return to_gray_tensor
+
+
+def _run_loftr(matcher, query_rgb, ref_rgb, conf_thresh, gray_tensor_fn):
+    """kornia LoFTR 단일 쌍 매칭."""
+    import torch
+
+    q_tensor, q_sx, q_sy = gray_tensor_fn(query_rgb)
+    r_tensor, r_sx, r_sy = gray_tensor_fn(ref_rgb)
+
+    with torch.no_grad():
+        result = matcher({"image0": q_tensor, "image1": r_tensor})
+
+    mkpts0 = result["keypoints0"].cpu().numpy()
+    mkpts1 = result["keypoints1"].cpu().numpy()
+    confs  = result["confidence"].cpu().numpy()
+
+    mask   = confs >= conf_thresh
+    mkpts0 = mkpts0[mask] * np.array([q_sx, q_sy], dtype=np.float32)
+    mkpts1 = mkpts1[mask] * np.array([r_sx, r_sy], dtype=np.float32)
+    confs  = confs[mask]
+
+    n_good = len(mkpts0)
+    score  = float(confs.sum())
+    return mkpts0, mkpts1, confs, n_good, score
+
+
+# ── JamMa helper ──────────────────────────────────────────────────────────
+
+def _lower_config(yacs_cfg):
+    """yacs CfgNode → plain dict (모든 키를 lowercase). pytorch_lightning 의존 회피."""
+    from yacs.config import CfgNode as CN
+    if not isinstance(yacs_cfg, CN):
+        return yacs_cfg
+    return {k.lower(): _lower_config(v) for k, v in yacs_cfg.items()}
+
+
+def _load_jamma(config, dev):
+    """JamMa 모델 로드."""
+    import torch
+
+    jamma_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "third_party", "JamMa"))
+    if jamma_root not in sys.path:
+        sys.path.insert(0, jamma_root)
+
+    # PassThroughProfiler 대용 (pytorch_lightning 의존 회피)
+    import contextlib
+
+    class _NoOpProfiler:
+        @contextlib.contextmanager
+        def profile(self, action_name):
+            yield action_name
+
+    # profiler 모듈을 먼저 패치하여 pytorch_lightning import 방지
+    import importlib, types
+    _profiler_mod = types.ModuleType("src.utils.profiler")
+    _profiler_mod.PassThroughProfiler = _NoOpProfiler
+    sys.modules["src.utils.profiler"] = _profiler_mod
+
+    from src.config.default import get_cfg_defaults
+    from src.jamma.jamma import JamMa
+    from src.jamma.backbone import CovNextV2_nano
+
+    # build config with inference mode
+    jamma_cfg = get_cfg_defaults()
+    jamma_cfg.JAMMA.MATCH_COARSE.INFERENCE = True
+    jamma_cfg.JAMMA.FINE.INFERENCE = True
+    jamma_cfg.JAMMA.MATCH_COARSE.USE_SM = True
+
+    fc = config["features"]
+    coarse_thr = float(fc.get("jamma_coarse_thr", 0.2))
+    fine_thr = float(fc.get("jamma_fine_thr", 0.1))
+    jamma_cfg.JAMMA.MATCH_COARSE.THR = coarse_thr
+    jamma_cfg.JAMMA.FINE.THR = fine_thr
+
+    _config = _lower_config(jamma_cfg)
+
+    backbone = CovNextV2_nano()
+    matcher = JamMa(config=_config['jamma'])
+
+    ckpt_path = fc.get("jamma_ckpt", "")
+    if not ckpt_path:
+        ckpt_path = os.path.join(jamma_root, "weights", "jamma.ckpt")
+    # 상대 경로면 프로젝트 루트 기준으로 resolve
+    if not os.path.isabs(ckpt_path):
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        ckpt_path = os.path.join(project_root, ckpt_path)
+
+    if os.path.isfile(ckpt_path):
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
+    else:
+        # official weight from hub
+        state_dict = torch.hub.load_state_dict_from_url(
+            'https://github.com/leoluxxx/JamMa/releases/download/v0.1/jamma.ckpt',
+            file_name='jamma.ckpt')['state_dict']
+
+    # PL_JamMa wraps backbone + matcher; split the state dict
+    backbone_sd = {}
+    matcher_sd = {}
+    for k, v in state_dict.items():
+        if k.startswith("backbone."):
+            backbone_sd[k[len("backbone."):]] = v
+        elif k.startswith("matcher."):
+            matcher_sd[k[len("matcher."):]] = v
+
+    backbone.load_state_dict(backbone_sd, strict=True)
+    matcher.load_state_dict(matcher_sd, strict=True)
+
+    backbone = backbone.eval().to(dev)
+    matcher = matcher.eval().to(dev)
+
+    return backbone, matcher, ckpt_path
+
+
+def _make_jamma_preprocess_fn(dev, max_dim):
+    """JamMa용 이미지 전처리 클로저. RGB → resize → square pad → ImageNet normalize.
+
+    JamMa backbone은 query/ref를 batch dim으로 concat해서 처리하므로 두 이미지가
+    반드시 동일한 (H, W)를 가져야 함. 따라서 longest-edge를 max_dim으로 맞추고
+    bottom-right zero padding으로 max_dim × max_dim square로 만든다.
+    """
+    import torch
+    import torchvision.transforms as T
+
+    normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
+    # max_dim을 8의 배수로 정렬 (backbone이 1/8 downsample)
+    tgt = ((max_dim + 7) // 8) * 8
+
+    def preprocess(rgb_img):
+        """Returns: (tensor, scale_x, scale_y, valid_w, valid_h).
+        valid_w/valid_h = padded square 내 실제 이미지 영역 크기 (border filter용).
+        """
+        orig_h, orig_w = rgb_img.shape[:2]
+        # longest-edge = tgt 되도록 resize (up/down 모두)
+        s = tgt / max(orig_h, orig_w)
+        nw, nh = max(1, int(round(orig_w * s))), max(1, int(round(orig_h * s)))
+        nw, nh = min(nw, tgt), min(nh, tgt)
+        rgb_img = cv2.resize(rgb_img, (nw, nh), interpolation=cv2.INTER_AREA)
+
+        scale_x = orig_w / nw
+        scale_y = orig_h / nh
+
+        # bottom-right zero padding → tgt × tgt square
+        padded = np.zeros((tgt, tgt, 3), dtype=np.uint8)
+        padded[:nh, :nw, :] = rgb_img
+
+        img_t = torch.from_numpy(padded.astype(np.float32) / 255.0).permute(2, 0, 1)
+        img_t = normalize(img_t).unsqueeze(0).to(dev)  # (1,3,tgt,tgt)
+        return img_t, scale_x, scale_y, nw, nh
+
+    return preprocess
+
+
+def _run_jamma(backbone, matcher, query_rgb, ref_rgb, preprocess_fn):
+    """
+    JamMa 단일 쌍 매칭.
+    Returns:
+        mkpts0, mkpts1, confs, n_good, score
+    """
+    import torch
+
+    q_tensor, q_sx, q_sy, q_vw, q_vh = preprocess_fn(query_rgb)
+    r_tensor, r_sx, r_sy, r_vw, r_vh = preprocess_fn(ref_rgb)
+
+    data = {
+        "imagec_0": q_tensor,
+        "imagec_1": r_tensor,
+    }
+
+    with torch.no_grad():
+        backbone(data)
+        matcher(data, mode='test')
+
+    mkpts0 = data["mkpts0_f"].cpu().numpy()
+    mkpts1 = data["mkpts1_f"].cpu().numpy()
+    confs = data["mconf_f"].cpu().numpy()
+
+    if len(mkpts0) == 0:
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.array([]), 0, 0.0
+
+    # padded square 내 실제 이미지 영역 밖 매칭 제거 (bottom-right padding)
+    valid = ((mkpts0[:, 0] < q_vw) & (mkpts0[:, 1] < q_vh) &
+             (mkpts1[:, 0] < r_vw) & (mkpts1[:, 1] < r_vh))
+    mkpts0 = mkpts0[valid]
+    mkpts1 = mkpts1[valid]
+    confs = confs[valid]
+
+    if len(mkpts0) == 0:
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.array([]), 0, 0.0
+
+    # scale back to original image coords
+    mkpts0 = mkpts0 * np.array([q_sx, q_sy], dtype=np.float32)
+    mkpts1 = mkpts1 * np.array([r_sx, r_sy], dtype=np.float32)
+
+    n_good = len(mkpts0)
+    score = float(confs.sum())
+    return mkpts0, mkpts1, confs, n_good, score
+
+
 # ── RoMa direct helper ────────────────────────────────────────────────────
 
 def _load_roma(config, dev):
@@ -228,8 +465,8 @@ def _load_matcher(config, dev):
     """
     config['features']['matcher_name'] 에 따라 적절한 matcher를 로드.
     Returns:
-        matcher_obj  : 모델 객체
-        matcher_type : "eloftr" | "roma" | "vismatch"
+        matcher_obj  : 모델 객체 (jamma의 경우 (backbone, matcher) 튜플)
+        matcher_type : "eloftr" | "roma" | "jamma" | "vismatch"
         info_str     : 로그용 문자열
     """
     fc           = config["features"]
@@ -240,6 +477,14 @@ def _load_matcher(config, dev):
         info = (f"EfficientLoFTR  ckpt={os.path.basename(ckpt_path)}  "
                 f"mode={'opt' if use_opt else 'full'}  device={dev}")
         return matcher, "eloftr", info
+    elif matcher_name == "loftr":
+        matcher, variant = _load_loftr(config, dev)
+        info = f"LoFTR [{variant}]  device={dev}"
+        return matcher, "loftr", info
+    elif matcher_name == "jamma":
+        backbone, matcher, ckpt_path = _load_jamma(config, dev)
+        info = f"JamMa  ckpt={os.path.basename(ckpt_path)}  device={dev}"
+        return (backbone, matcher), "jamma", info
     elif matcher_name in ("roma", "roma-tiny", "tiny-roma"):
         config["features"]["roma_size"] = "tiny" if "tiny" in matcher_name else "full"
         matcher, label = _load_roma(config, dev)
@@ -255,9 +500,10 @@ def _load_matcher(config, dev):
 
 def _run_single_match(matcher_type, matcher, query_rgb, ref_rgb,
                       conf_thresh, vismatch_max_dim,
-                      gray_tensor_fn=None):
+                      gray_tensor_fn=None, jamma_preprocess_fn=None,
+                      loftr_gray_fn=None):
     """
-    단일 이미지 쌍 매칭. 두 백엔드를 통일된 인터페이스로 추상화.
+    단일 이미지 쌍 매칭. 백엔드를 통일된 인터페이스로 추상화.
     Returns:
         mkpts0  : (M, 2) query keypoints (original image coords)
         mkpts1  : (M, 2) ref   keypoints (original image coords)
@@ -279,6 +525,11 @@ def _run_single_match(matcher_type, matcher, query_rgb, ref_rgb,
         n_good = int(mask.sum())
         score  = float(confs[mask].sum())
         return mkpts0[mask], mkpts1[mask], confs[mask], n_good, score
+    elif matcher_type == "loftr":
+        return _run_loftr(matcher, query_rgb, ref_rgb, conf_thresh, loftr_gray_fn)
+    elif matcher_type == "jamma":
+        backbone, jamma_matcher = matcher
+        return _run_jamma(backbone, jamma_matcher, query_rgb, ref_rgb, jamma_preprocess_fn)
     elif matcher_type == "roma":
         return _match_roma(matcher, query_rgb, ref_rgb)
     else:
@@ -311,6 +562,12 @@ def step6_match(step5_data, config, output_dir, save_images=True):
 
     gray_tensor_fn = (_make_gray_tensor_fn(dev, eloftr_max_dim)
                       if matcher_type == "eloftr" else None)
+    loftr_max_dim = int(fc.get("loftr_max_dim", 840))
+    loftr_gray_fn = (_make_loftr_gray_tensor_fn(dev, loftr_max_dim)
+                     if matcher_type == "loftr" else None)
+    jamma_max_dim = int(fc.get("jamma_max_dim", 840))
+    jamma_preprocess_fn = (_make_jamma_preprocess_fn(dev, jamma_max_dim)
+                           if matcher_type == "jamma" else None)
 
     best_mkpts_q  = np.zeros((0, 2))
     best_mkpts_r  = np.zeros((0, 2))
@@ -330,6 +587,8 @@ def step6_match(step5_data, config, output_dir, save_images=True):
                 matcher_type, matcher, query_rgb, ref_rgb,
                 conf_thresh, vismatch_max_dim,
                 gray_tensor_fn=gray_tensor_fn,
+                jamma_preprocess_fn=jamma_preprocess_fn,
+                loftr_gray_fn=loftr_gray_fn,
             )
         except Exception as e:
             print(f"  Rank{rank+1} matching failed: {e}")
@@ -465,6 +724,12 @@ def step6a_match_viz(query_dir, db, config, output_dir):
 
     gray_tensor_fn = (_make_gray_tensor_fn(dev, eloftr_max_dim)
                       if matcher_type == "eloftr" else None)
+    loftr_max_dim = int(fc.get("loftr_max_dim", 840))
+    loftr_gray_fn = (_make_loftr_gray_tensor_fn(dev, loftr_max_dim)
+                     if matcher_type == "loftr" else None)
+    jamma_max_dim = int(fc.get("jamma_max_dim", 840))
+    jamma_preprocess_fn = (_make_jamma_preprocess_fn(dev, jamma_max_dim)
+                           if matcher_type == "jamma" else None)
 
     save_dir = os.path.join(output_dir, "step6a_results")
     os.makedirs(save_dir, exist_ok=True)
@@ -509,6 +774,8 @@ def step6a_match_viz(query_dir, db, config, output_dir):
                     matcher_type, matcher, query_rgb, ref_rgb,
                     conf_thresh, vismatch_max_dim,
                     gray_tensor_fn=gray_tensor_fn,
+                    loftr_gray_fn=loftr_gray_fn,
+                    jamma_preprocess_fn=jamma_preprocess_fn,
                 )
             except Exception as e:
                 print(f"    Rank{rank+1} failed: {e}"); continue
