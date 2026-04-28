@@ -4,7 +4,9 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .step.step5_retrieval import step5_retrieval
+from .step.step5_retrieval_type2 import step5_retrieval_type2
 from .step.step6_match import step6_match
+from .step.step6_match_type2 import step6_match_type2
 from .step.step7_pnp import step7_pnp
 from .step.multi_cam import load_multi_cam_config, parse_kapture_records, find_sister_images
 
@@ -15,13 +17,18 @@ def localize_single(query_image_path, db, config, work_dir, save_images=True,
 
     Args:
         query_images: multi-cam 모드 시 {cam_id: path} 딕셔너리. None = 단일 캠.
+
+    config.multi_cam.retrieval_type == "type2"이면 step5_retrieval_type2 사용.
     """
     os.makedirs(work_dir, exist_ok=True)
+    retrieval_type = config.get("multi_cam", {}).get("retrieval_type", "type1")
+    step5_fn = step5_retrieval_type2 if retrieval_type == "type2" else step5_retrieval
+    step6_fn = step6_match_type2 if retrieval_type == "type2" else step6_match
     try:
-        s5 = step5_retrieval(query_image_path, db, config, work_dir,
-                             save_images=save_images,
-                             query_images=query_images)
-        s6 = step6_match(s5, config, work_dir, save_images=save_images)
+        s5 = step5_fn(query_image_path, db, config, work_dir,
+                      save_images=save_images,
+                      query_images=query_images)
+        s6 = step6_fn(s5, config, work_dir, save_images=save_images)
         result = step7_pnp(s6, s5, config, work_dir, save_images=save_images)
         return result.get("estimated_pose") if result else None
     except Exception as e:

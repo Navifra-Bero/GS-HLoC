@@ -21,7 +21,8 @@ from pipeline import (
     step0_align, step1_viewpoints, step2_render, step2_render_2dgs, step2_render_sgs,
     step2_scaffold_render,
     step3_global_desc, step4_build_db,
-    step5_retrieval, step6_match, step6a_match_viz,
+    step5_retrieval, step5_retrieval_type2, step6_match, step6a_match_viz,
+    step6_match_type2,
     step6_match_dedode, step6a_match_viz_dedode,
     step7_pnp,
     run_test_batch,
@@ -233,12 +234,16 @@ def main():
         sisters = find_sister_images(query_path, _mc_records, _mc_cam_ids)
         return sisters if len(sisters) > 1 else None
 
+    # multi_cam.retrieval_type == "type2" → main→sub 종속 리트리벌 사용
+    _retrieval_type = config.get("multi_cam", {}).get("retrieval_type", "type1")
+    _step5_fn = step5_retrieval_type2 if _retrieval_type == "type2" else step5_retrieval
+
     s5 = None
     if run_online or args.step == "5_retrieval":
         _qimgs = _build_query_images(args.query_image)
-        s5 = step5_retrieval(args.query_image, db, config, args.output_dir,
-                             query_images=_qimgs)
-    elif args.step in ("6_match", "6_match_dedode", "7_pnp"):
+        s5 = _step5_fn(args.query_image, db, config, args.output_dir,
+                       query_images=_qimgs)
+    elif args.step in ("6_match", "6_match_type2", "6_match_dedode", "7_pnp"):
         s5 = load_pkl(args.output_dir, "step5_data.pkl")
         if s5 is None:
             print("ERROR: step5_data.pkl 없음. 5_retrieval 먼저 실행.")
@@ -258,10 +263,14 @@ def main():
 
     s6 = None
     if run_online or args.step == "6_match":
-        if _use_dedode:
+        if _retrieval_type == "type2":
+            s6 = step6_match_type2(s5, config, args.output_dir)
+        elif _use_dedode:
             s6 = step6_match_dedode(s5, config, args.output_dir)
         else:
             s6 = step6_match(s5, config, args.output_dir)
+    elif args.step == "6_match_type2":
+        s6 = step6_match_type2(s5, config, args.output_dir)
     elif args.step == "6_match_dedode":
         s6 = step6_match_dedode(s5, config, args.output_dir)
     elif args.step == "7_pnp":

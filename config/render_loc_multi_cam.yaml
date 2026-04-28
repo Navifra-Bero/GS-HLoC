@@ -1,0 +1,119 @@
+# =============================================================================
+# RenderLoc Multi-Camera Configuration (Type 2: dependent retrieval)
+# =============================================================================
+# Type 2 retrieval flow:
+#   1) main_cam이 full DB에서 top-K 리트리벌 (K = matching.top_k_retrieval)
+#   2) 선택된 K개 viewpoint의 다른 yaw 시점만 모아서 sub_cam 후보 풀 구성
+#      (총 K × (num_yaw_angles - 1) 개)
+#   3) sub_cam은 각 main rank의 viewpoint에서 같은 yaw 제외 best 선택
+#      → rank k에서 두 cam이 같은 viewpoint, 다른 yaw 페어링
+# =============================================================================
+
+camera:
+  fx: 1039.04598063
+  fy: 1041.49694151
+  cx: 937.04407689
+  cy: 560.82673816
+  width: 1920
+  height: 1200
+  depth_scale: 1000.0
+  depth_min: 0.3
+  depth_max: 15.0
+
+sampling:
+  max_floors: 1
+  min_floor_gap: 2.5
+  max_floor_height: 5.0
+  floor_band: 0.3
+  num_yaw_angles: 4
+  height_offsets_m: [1.0]
+
+rendering:
+  inpaint_background: true
+  inpaint_radius: 3
+  ceiling_clip: true
+  ceiling_margin: 0.5
+  output_dir: "data/rendered/"
+  point_size: 2.0
+  rho_min: 2.0
+  render_color: true
+
+features:
+  superpoint_model: "models/superpoint_v1.pt"
+  max_keypoints: 1024
+  keypoint_threshold: 0.005
+  global_model: "models/netvlad.pt"
+  global_desc_dim: 512
+  use_gpu: true
+  global_desc_method: "mixvpr"
+  mixvpr_ckpt: "models/mixvpr_resnet50_4096.ckpt"
+  mixvpr_out_dim: 4096
+  grid_n: 1
+  use_depth_desc: true
+  depth_bins: 32
+  depth_rgb_weight: 0.7
+  matcher_name: "jamma"
+  eloftr_ckpt: ""
+  eloftr_opt: false
+  match_conf_thresh: 0.2
+  eloftr_max_dim: 840
+  vismatch_max_dim: 840
+  loftr_variant: "indoor"
+  loftr_max_dim: 840
+  jamma_ckpt: "third_party/JamMa/weights/jamma.ckpt"
+  jamma_max_dim: 640
+  jamma_coarse_thr: 0.2
+  jamma_fine_thr: 0.1
+
+matching:
+  superglue_model: "models/superglue_indoor.pth"
+  match_threshold: 0.2
+  retrieval_factor: 3
+  top_k_retrieval: 30      # type2: main cam이 가져올 후보 수 (sub cam 풀 = K × (num_yaw_angles-1))
+  use_gpu: true
+
+pnp:
+  solver: "opencv"
+  reproj_threshold: 4.0
+  min_inliers: 6
+  refine: true
+  ransac_iterations: 1000
+  pnp_confidence: 0.99
+  superansac_max_iterations: 1000
+  superansac_confidence: 0.99
+  multi_cam_consistency_trans_thresh: 0.3   # cam별 rig pose fusion 허용 위치 차이(m)
+  multi_cam_consistency_rot_thresh_deg: 2.0 # cam별 rig pose fusion 허용 회전 차이(deg)
+  multi_cam_joint_refine: true              # 고정 rig extrinsic 기반 multi-cam reprojection refine
+  multi_cam_pose_selection: "adaptive"      # best/fusion/joint/adaptive
+  multi_cam_pose_score: "median"            # adaptive 선택 기준: median 또는 rmse
+  multi_cam_accept_improve_ratio: 0.90      # baseline(best cam)보다 10% 이상 좋아질 때만 fusion/joint 채택
+  multi_cam_best_cam_degrade_ratio: 1.10    # best cam reprojection이 10% 이상 나빠지면 fusion/joint 거부
+  joint_reproj_fscale: 8.0                  # robust refine soft_l1 scale(px)
+  joint_max_nfev: 50
+  joint_max_points_per_cam: 1200
+
+icp:
+  enable: false
+  max_iterations: 30
+  max_correspondence_dist: 1.0
+  fitness_threshold: 0.3
+  use_gicp: true
+
+database:
+  db_path: "data/image_db.bin"
+  ply_map_path: ""
+
+multi_cam:
+  enabled: true
+  # ── Type 2: 종속 리트리벌 (main → sub) ─────────────────────────────────
+  retrieval_type: "type2"
+  main_cam: "cam_3"           # full DB 리트리벌 수행
+  sub_cams: ["cam_1"]         # main 결과의 다른 yaw에서만 리트리벌. 여러 개 가능
+  position_tol: 0.05          # 같은 viewpoint 판정 허용오차 (m). pose 위치 이내면 동일 viewpoint
+  match_top_k: 5              # step6_match_type2에서 feature matching을 수행할 final 후보 수
+  # ── 호환용 (기존 step6/7 코드가 참조) ──────────────────────────────────
+  cam_ids: ["cam_3", "cam_1"]
+  primary_cam: "cam_3"
+  kapture_dir: "kapture_1_3/sensors"
+  primary_cam_weight: 0.6
+  min_match_threshold: 10
