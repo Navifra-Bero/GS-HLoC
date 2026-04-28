@@ -26,8 +26,8 @@ sampling:
   min_floor_gap: 2.5     # 2.5m 이내 peak 병합
   max_floor_height: 5.0  # 5m 이상 무시
   floor_band: 0.3
-  num_yaw_angles: 6
-  height_offsets_m: [0.0, 1.5]   # 기준높이 / 20cm 아래 / 20cm 위 → 4×3=12 views/pos
+  num_yaw_angles: 4
+  height_offsets_m: [1.0]   # 기준높이 / 20cm 아래 / 20cm 위 → 4×3=12 views/pos
 
 rendering:
   inpaint_background: true  # 활성화
@@ -117,3 +117,15 @@ icp:
 database:
   db_path: "data/image_db.bin"
   ply_map_path: ""
+
+multi_cam:
+  enabled: true              # true = multi-cam retrieval+matching 활성화
+  cam_ids: ["cam_1", "cam_3"] # 사용할 카메라 ID 목록
+  primary_cam: "cam_3"        # PnP에 사용할 주 카메라 (intrinsics 기준)
+  kapture_dir: "kapture/sensors"  # records_camera.txt 위치
+  # ── Retrieval 가중치 ──────────────────────────────────────────────────
+  # N=1: primary_cam_weight=1.0 (고정)
+  # N=2: primary=primary_cam_weight, other=1-primary_cam_weight
+  # N=k: primary=primary_cam_weight, 나머지 각각=(1-primary_cam_weight)/(k-1)
+  primary_cam_weight: 0.6     # primary cam 비중 (0.5~0.8 권장)
+  min_match_threshold: 10    # primary cam의 good match 수 < 이 값이면 sub-cam fallback 시도
