@@ -21,11 +21,11 @@ class VPSPublisher(Node):
         self.timer = self.create_timer(0.25, self.timer_callback)
 
         # T_align 로드: GS 학습 시 사용한 바닥 정렬 변환 (Kapture world → GS world)
-        step0_pkl = '/home/park/loc_ws/src/render_loc/output/gs_test/step0_data.pkl'
+        step0_pkl = '/home/park/loc_ws/src/render_loc/output/sgs_multi_cam_test/step0_data.pkl'
         step0_data = pickle.load(open(step0_pkl, 'rb'))
         self.T_align = np.array(step0_data['T_align'], dtype=np.float64)
 
-        pred_csv = '/home/park/loc_ws/src/render_loc/output/gs_test/test_results/cam_3_ransac_no_refine/trajectory.csv'
+        pred_csv = '/home/park/loc_ws/src/render_loc/output/sgs_multi_cam_test/test_results/cam_3/trajectory.csv'
         gt_path  = '/home/park/loc_ws/src/render_loc/kapture/sensors/trajectories.txt'
 
         # GT: Kapture world → GS world 변환
@@ -50,6 +50,13 @@ class VPSPublisher(Node):
 
         self.current_idx = 0
         self.last_inlier_pose = None  # outlier 시 fallback용
+
+        # Roll 보정 없음 — GT orientation 자체를 그대로 사용
+        # 뷰가 틀어져 있으면 아래 주석 해제해서 조정:
+        #   왼쪽 90° : [0, 0, +0.7071, 0.7071]
+        #   오른쪽 90°: [0, 0, -0.7071, 0.7071]
+        #   180°      : [0, 0,  1.0,    0.0   ]
+        self._q_roll = [0.0, 0.0, 0.0, 1.0]  # identity (no roll)
 
     def _classify_inliers(self, pred_poses):
         """GT 대비 translation error < OUTLIER_THRESH 이면 inlier."""
@@ -154,6 +161,18 @@ class VPSPublisher(Node):
             path.poses.append(p)
         return path
 
+    @staticmethod
+    def _quat_mul(q1, q2):
+        """Hamilton product q1 * q2. 포맷: [x, y, z, w]."""
+        x1, y1, z1, w1 = q1
+        x2, y2, z2, w2 = q2
+        return [
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        ]
+
     def calculate_error(self, pred, gt):
         trans_err = np.linalg.norm(np.array(pred[:3]) - np.array(gt[:3]))
         p_quat = np.array(pred[3:])
@@ -190,10 +209,15 @@ class VPSPublisher(Node):
         msg.pose.position.x    = pose_to_pub[0]
         msg.pose.position.y    = pose_to_pub[1]
         msg.pose.position.z    = pose_to_pub[2]
-        msg.pose.orientation.x = pose_to_pub[3]
-        msg.pose.orientation.y = pose_to_pub[4]
-        msg.pose.orientation.z = pose_to_pub[5]
-        msg.pose.orientation.w = pose_to_pub[6]
+        # orientation: GT 사용 (안정적), position: pred 사용 (VPS 추정값)
+        if timestamp in self.gt_poses:
+            q = self.gt_poses[timestamp][3:7]
+        else:
+            q = pose_to_pub[3:7]
+        msg.pose.orientation.x = q[0]
+        msg.pose.orientation.y = q[1]
+        msg.pose.orientation.z = q[2]
+        msg.pose.orientation.w = q[3]
         self.pose_pub.publish(msg)
 
         err_msg = String()

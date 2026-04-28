@@ -541,6 +541,7 @@ def _run_single_match(matcher_type, matcher, query_rgb, ref_rgb,
 def step6_match(step5_data, config, output_dir, save_images=True):
     """EfficientLoFTR or vismatch: query vs top-K candidates → best match."""
     import torch
+    from .multi_cam import load_multi_cam_config
 
     print("\n" + "="*60 + "\nSTEP 6: Feature matching\n" + "="*60)
 
@@ -550,9 +551,29 @@ def step6_match(step5_data, config, output_dir, save_images=True):
     eloftr_max_dim   = int(fc.get("eloftr_max_dim", 840))
     vismatch_max_dim = int(fc.get("vismatch_max_dim", 840))
 
-    query_rgb  = step5_data["query_rgb"]
-    candidates = step5_data["candidates"]
-    cos_sims   = step5_data.get("cos_sims", [1.0] * len(candidates))
+    query_rgb   = step5_data["query_rgb"]
+    candidates  = step5_data["candidates"]
+    cos_sims    = step5_data.get("cos_sims", [1.0] * len(candidates))
+    query_images = step5_data.get("query_images")  # {cam_id: path} or None
+
+    # multi-cam 설정
+    mc_enabled, mc_cam_ids, _, _cfg_primary = load_multi_cam_config(config)
+    is_multi = mc_enabled and query_images is not None and len(query_images) > 1
+    # step5에서 avg_sim 기준으로 선택된 dynamic primary 우선 사용
+    mc_primary = step5_data.get("dynamic_primary") or _cfg_primary
+    cam_weights = {}
+    if is_multi:
+        mc_cfg    = config.get("multi_cam", {})
+        primary_w = float(mc_cfg.get("primary_cam_weight", 0.6))
+        cam_list  = list(query_images.keys())
+        N         = len(cam_list)
+        other_w   = (1.0 - primary_w) / (N - 1) if N > 1 else 0.0
+        cam_weights = {c: (primary_w if c == mc_primary else other_w) for c in cam_list}
+        print(f"  Mode: multi-cam {cam_list}  primary={mc_primary}★  "
+              f"weights={' '.join(f'{c}={w:.2f}' for c,w in cam_weights.items())}")
+        cam_rgbs = {}
+        for cam_id, cam_path in query_images.items():
+            cam_rgbs[cam_id] = cv2.cvtColor(cv2.imread(cam_path), cv2.COLOR_BGR2RGB)
 
     matcher, matcher_type, info_str = _load_matcher(config, dev)
     print(f"  Matcher: {info_str}")
@@ -576,95 +597,305 @@ def step6_match(step5_data, config, output_dir, save_images=True):
     best_ref_rgb  = cv2.cvtColor(cv2.imread(candidates[0]["rgb_path"]), cv2.COLOR_BGR2RGB)
     best_score    = -1.0
     best_n        = 0
+    best_cam_id   = mc_primary if is_multi else None
     all_match_counts = []
     all_scores       = []
+    all_cam_scores   = []   # [{cam_id: score}, ...] 멀티캠 시각화용
+    # best candidate의 per-cam 매칭 결과 저장 (시각화용)
+    best_cam_mkpts0   = {}   # {cam_id: mkpts}
+    best_cam_mkpts1   = {}
+    best_cam_confs    = {}
+    best_cam_n_good   = {}
+    best_cam_ref_rgbs = {}   # {cam_id: ref_img}
+    best_cam_entries  = {}   # {cam_id: render entry} → step7 multi-cam PnP용
+
+    # step5에서 카메라별 개별 top-k 결과 가져오기
+    cam_top_results_s5 = step5_data.get("cam_top_results")  # {cam_id: [(entry,sim),...]}
+
+    # ── sub-cam fallback 임계값 ────────────────────────────────────────────────
+    # primary cam이 이 값보다 적은 매칭을 내면 sub-cam도 시도한다.
+    min_match_thr = int(config.get("multi_cam", {}).get(
+        "min_match_threshold",
+        config.get("pnp", {}).get("min_inliers", 6)))
 
     for rank, cand in enumerate(candidates):
         ref_rgb = cv2.cvtColor(cv2.imread(cand["rgb_path"]), cv2.COLOR_BGR2RGB)
 
-        try:
-            mkpts0, mkpts1, confs, n_good, score = _run_single_match(
-                matcher_type, matcher, query_rgb, ref_rgb,
-                conf_thresh, vismatch_max_dim,
-                gray_tensor_fn=gray_tensor_fn,
-                jamma_preprocess_fn=jamma_preprocess_fn,
-                loftr_gray_fn=loftr_gray_fn,
-            )
-        except Exception as e:
-            print(f"  Rank{rank+1} matching failed: {e}")
-            all_match_counts.append(0)
-            all_scores.append(0.0)
-            continue
+        if is_multi and cam_top_results_s5:
+            # ── 메인 먼저, 부족 시 서브 fallback ─────────────────────────
+            cam_scores   = {}
+            cam_mkpts0   = {}
+            cam_mkpts1   = {}
+            cam_confs    = {}
+            cam_n_good   = {}
+            cam_ref_rgbs = {}
+            cam_entries  = {}
+            cam_was_tried = set()   # 실제 매칭 시도한 cam (시각화용)
 
-        mean_conf = float(confs.mean()) if len(confs) > 0 else 0.0
-        ret_sim   = cos_sims[rank] if rank < len(cos_sims) else 0.0
-        all_match_counts.append(n_good)
-        all_scores.append(score)
+            def _load_cam_ref(cam_id):
+                results = cam_top_results_s5.get(cam_id, []) if cam_top_results_s5 else []
+                entry = results[rank][0] if rank < len(results) else cand
+                img   = cv2.cvtColor(cv2.imread(entry["rgb_path"]), cv2.COLOR_BGR2RGB)
+                return img, entry
 
-        print(f"  Rank{rank+1} #{cand['id']:>4}: {n_good:>3} good  "
-              f"score={score:>7.2f}  mean_conf={mean_conf:.3f}  ret_sim={ret_sim:.4f}")
+            def _do_match(cam_id, q_img, cam_ref):
+                try:
+                    return _run_single_match(
+                        matcher_type, matcher, q_img, cam_ref,
+                        conf_thresh, vismatch_max_dim,
+                        gray_tensor_fn=gray_tensor_fn,
+                        jamma_preprocess_fn=jamma_preprocess_fn,
+                        loftr_gray_fn=loftr_gray_fn,
+                    )
+                except Exception as e:
+                    print(f"    [{cam_id}] Rank{rank+1} failed: {e}")
+                    return np.zeros((0,2)), np.zeros((0,2)), np.array([]), 0, 0.0
 
-        if score > best_score:
-            best_score   = score
-            best_n       = n_good
-            best_mkpts_q = mkpts0
-            best_mkpts_r = mkpts1
-            best_confs   = confs
-            best_cand    = cand
-            best_ref_rgb = ref_rgb
+            # ── Step 1: primary cam 매칭 (항상) ──────────────────────────
+            prim_ref, prim_entry = _load_cam_ref(mc_primary)
+            cam_ref_rgbs[mc_primary] = prim_ref
+            cam_entries[mc_primary]  = prim_entry
+            cam_was_tried.add(mc_primary)
+            m0, m1, cf, ng, sc = _do_match(mc_primary, cam_rgbs[mc_primary], prim_ref)
+            cam_scores[mc_primary] = sc
+            cam_mkpts0[mc_primary] = m0
+            cam_mkpts1[mc_primary] = m1
+            cam_confs[mc_primary]  = cf
+            cam_n_good[mc_primary] = ng
 
-    print(f"\n  Best: #{best_cand['id']}  matches={best_n}  score={best_score:.2f}")
+            primary_ok = ng >= min_match_thr
+
+            # ── Step 2: primary 부족 시 sub-cam fallback ─────────────────
+            for cam_id, q_img in cam_rgbs.items():
+                if cam_id == mc_primary:
+                    continue
+                if primary_ok:
+                    # primary 충분 → sub 스킵
+                    cam_scores[cam_id] = 0.0
+                    cam_mkpts0[cam_id] = np.zeros((0, 2))
+                    cam_mkpts1[cam_id] = np.zeros((0, 2))
+                    cam_confs[cam_id]  = np.array([])
+                    cam_n_good[cam_id] = 0
+                    sub_ref, sub_entry = _load_cam_ref(cam_id)
+                    cam_ref_rgbs[cam_id] = sub_ref   # 시각화용으로 이미지는 로드
+                    cam_entries[cam_id]  = sub_entry
+                else:
+                    # primary 부족 → sub 시도
+                    sub_ref, sub_entry = _load_cam_ref(cam_id)
+                    cam_ref_rgbs[cam_id] = sub_ref
+                    cam_entries[cam_id]  = sub_entry
+                    cam_was_tried.add(cam_id)
+                    m0, m1, cf, ng, sc = _do_match(cam_id, q_img, sub_ref)
+                    cam_scores[cam_id] = sc
+                    cam_mkpts0[cam_id] = m0
+                    cam_mkpts1[cam_id] = m1
+                    cam_confs[cam_id]  = cf
+                    cam_n_good[cam_id] = ng
+
+            if not primary_ok:
+                print(f"  Rank{rank+1}: primary [{mc_primary}] n_good={cam_n_good[mc_primary]} "
+                      f"< {min_match_thr} → sub-cam fallback 시도")
+
+            # PnP cam = 매칭 수 최대인 cam
+            pnp_cam = max(cam_n_good, key=cam_n_good.get)
+            pnp_m0  = cam_mkpts0[pnp_cam]
+            pnp_m1  = cam_mkpts1[pnp_cam]
+            pnp_cf  = cam_confs[pnp_cam]
+            pnp_ng  = cam_n_good[pnp_cam]
+
+            combined_score = sum(cam_weights.get(cid, 1.0) * sc
+                                 for cid, sc in cam_scores.items()
+                                 if cid in cam_was_tried)
+
+            ret_sim = cos_sims[rank] if rank < len(cos_sims) else 0.0
+            all_match_counts.append(pnp_ng)
+            all_scores.append(combined_score)
+            all_cam_scores.append(dict(cam_scores))
+
+            cam_log = "  ".join(
+                f"{k}:{cam_n_good[k]}({'✓' if k in cam_was_tried else 'skip'})"
+                for k in cam_n_good)
+            print(f"  Rank{rank+1} #{cand['id']:>4}: combined={combined_score:>7.2f}  "
+                  f"pnp={pnp_cam}({pnp_ng})  [{cam_log}]  ret_sim={ret_sim:.4f}")
+
+            if combined_score > best_score:
+                best_score        = combined_score
+                best_n            = pnp_ng
+                best_mkpts_q      = pnp_m0
+                best_mkpts_r      = pnp_m1
+                best_confs        = pnp_cf
+                best_cand         = cand
+                best_ref_rgb      = cam_ref_rgbs.get(pnp_cam, ref_rgb)
+                best_cam_id       = pnp_cam
+                best_cam_mkpts0   = dict(cam_mkpts0)
+                best_cam_mkpts1   = dict(cam_mkpts1)
+                best_cam_confs    = dict(cam_confs)
+                best_cam_n_good   = dict(cam_n_good)
+                best_cam_ref_rgbs = dict(cam_ref_rgbs)
+                best_cam_entries  = dict(cam_entries)   # step7 multi-PnP용
+
+        else:
+            # ── 단일 캠 기존 방식 ─────────────────────────────────────────
+            try:
+                mkpts0, mkpts1, confs, n_good, score = _run_single_match(
+                    matcher_type, matcher, query_rgb, ref_rgb,
+                    conf_thresh, vismatch_max_dim,
+                    gray_tensor_fn=gray_tensor_fn,
+                    jamma_preprocess_fn=jamma_preprocess_fn,
+                    loftr_gray_fn=loftr_gray_fn,
+                )
+            except Exception as e:
+                print(f"  Rank{rank+1} matching failed: {e}")
+                all_match_counts.append(0)
+                all_scores.append(0.0)
+                continue
+
+            mean_conf = float(confs.mean()) if len(confs) > 0 else 0.0
+            ret_sim   = cos_sims[rank] if rank < len(cos_sims) else 0.0
+            all_match_counts.append(n_good)
+            all_scores.append(score)
+
+            print(f"  Rank{rank+1} #{cand['id']:>4}: {n_good:>3} good  "
+                  f"score={score:>7.2f}  mean_conf={mean_conf:.3f}  ret_sim={ret_sim:.4f}")
+
+            if score > best_score:
+                best_score   = score
+                best_n       = n_good
+                best_mkpts_q = mkpts0
+                best_mkpts_r = mkpts1
+                best_confs   = confs
+                best_cand    = cand
+                best_ref_rgb = ref_rgb
+
+    best_cam_str = f"  cam={best_cam_id}" if best_cam_id else ""
+    print(f"\n  Best: #{best_cand['id']}  matches={best_n}  score={best_score:.2f}{best_cam_str}")
 
     matcher_name = fc.get("matcher_name", "eloftr")
 
     if save_images:
-        # ── 시각화 ───────────────────────────────────────────────────────
-        h1, w1 = query_rgb.shape[:2]; h2, w2 = best_ref_rgb.shape[:2]
-        th = max(h1, h2)
-        sq, sr = 1.0, 1.0
-        if h1 != th:
-            sq = th / h1; query_rgb    = cv2.resize(query_rgb,    (int(w1*sq), th))
-        if h2 != th:
-            sr = th / h2; best_ref_rgb = cv2.resize(best_ref_rgb, (int(w2*sr), th))
-        h1, w1 = query_rgb.shape[:2]; h2, w2 = best_ref_rgb.shape[:2]
-        canvas = np.concatenate([query_rgb, best_ref_rgb], axis=1)
-        mkpts_q_v = best_mkpts_q * sq
-        mkpts_r_v = best_mkpts_r * sr
+        def _draw_matches(ax, q_img, r_img, mkpts0, mkpts1, confs, title):
+            h1, w1 = q_img.shape[:2]; h2, w2 = r_img.shape[:2]
+            th = max(h1, h2)
+            sq = th / h1 if h1 != th else 1.0
+            sr = th / h2 if h2 != th else 1.0
+            qi = cv2.resize(q_img, (int(w1*sq), th)) if sq != 1.0 else q_img
+            ri = cv2.resize(r_img, (int(w2*sr), th)) if sr != 1.0 else r_img
+            canvas = np.concatenate([qi, ri], axis=1)
+            wq = qi.shape[1]
+            ax.imshow(canvas)
+            if len(mkpts0) > 0:
+                nc   = confs / (confs.max() + 1e-8)
+                cmap = plt.cm.RdYlGn(nc)
+                step = max(1, len(mkpts0) // 200)
+                for i in range(0, len(mkpts0), step):
+                    ax.plot([mkpts0[i,0]*sq, mkpts1[i,0]*sr + wq],
+                            [mkpts0[i,1]*sq, mkpts1[i,1]*sr],
+                            c=cmap[i], alpha=0.5, linewidth=0.8)
+                ax.scatter(mkpts0[:,0]*sq, mkpts0[:,1]*sq, c="cyan",   s=6, zorder=3)
+                ax.scatter(mkpts1[:,0]*sr + wq, mkpts1[:,1]*sr, c="yellow", s=6, zorder=3)
+            ax.set_title(title, fontsize=8); ax.axis("off")
 
-        fig, ax = plt.subplots(1, 1, figsize=(16, 6))
-        ax.imshow(canvas)
-        if len(mkpts_q_v) > 0:
-            norm_c = best_confs / (best_confs.max() + 1e-8)
-            cmap_v = plt.cm.RdYlGn(norm_c)
-            step_v = max(1, len(mkpts_q_v) // 200)
-            for i in range(0, len(mkpts_q_v), step_v):
-                ax.plot([mkpts_q_v[i,0], mkpts_r_v[i,0]+w1],
-                        [mkpts_q_v[i,1], mkpts_r_v[i,1]],
-                        c=cmap_v[i], alpha=0.5, linewidth=0.8)
-            ax.scatter(mkpts_q_v[:,0], mkpts_q_v[:,1], c="cyan",   s=8, zorder=3)
-            ax.scatter(mkpts_r_v[:,0]+w1, mkpts_r_v[:,1], c="yellow", s=8, zorder=3)
+        if is_multi:
+            # ── 멀티캠: 카메라별 행 + 구분선 + combined(primary) 행 ─────
+            cam_list_viz = list(cam_rgbs.keys())
+            n_rows_viz   = len(cam_list_viz) + 1 + 1   # cams + divider + combined
+            h_ratios     = [4] * len(cam_list_viz) + [0.3] + [4]
+            fig = plt.figure(figsize=(16, 6 * (len(cam_list_viz) + 1) + 0.5))
+            gs  = matplotlib.gridspec.GridSpec(n_rows_viz, 1,
+                                               height_ratios=h_ratios,
+                                               hspace=0.4, figure=fig)
+            match_summary = "  |  ".join(
+                f"R{r+1}:{n}" for r, n in enumerate(all_match_counts))
 
-        match_summary = "  |  ".join(
-            f"R{r+1}:{n}" for r, n in enumerate(all_match_counts))
-        ax.set_title(f"Step 6 [{matcher_name}]: best=#{best_cand['id']} ({best_n} matches)\n"
-                     f"{match_summary}")
-        ax.axis("off"); fig.tight_layout()
-        fig.savefig(os.path.join(output_dir, "step6_matching.png"), dpi=150); plt.close()
+            for row, cam_id in enumerate(cam_list_viz):
+                ax = fig.add_subplot(gs[row, 0])
+                m0  = best_cam_mkpts0.get(cam_id, np.zeros((0,2)))
+                m1  = best_cam_mkpts1.get(cam_id, np.zeros((0,2)))
+                cf  = best_cam_confs.get(cam_id, np.array([]))
+                ng  = best_cam_n_good.get(cam_id, 0)
+                sc  = cam_weights.get(cam_id, 0) * (
+                      all_cam_scores[-1].get(cam_id, 0.0)
+                      if all_cam_scores else 0.0)
+                star = "★" if cam_id == mc_primary else ""
+                skip_str = "" if best_cam_n_good.get(cam_id, 0) > 0 else " [main OK, sub skipped]"
+                # 각 cam의 own retrieval 렌더 이미지 사용 (primary 렌더 대신)
+                cam_ref_viz = best_cam_ref_rgbs.get(cam_id, best_ref_rgb)
+                _draw_matches(ax, cam_rgbs[cam_id], cam_ref_viz, m0, m1, cf,
+                              f"[{cam_id}{star}] → #{best_cand['id']}  "
+                              f"matches={ng}  score={all_cam_scores[-1].get(cam_id,0):.1f}  "
+                              f"w×score={sc:.1f}{skip_str}\n{match_summary}")
+
+            # 구분선
+            div_ax = fig.add_subplot(gs[len(cam_list_viz), 0])
+            div_ax.axhline(0.5, color="dimgray", lw=1.5)
+            div_ax.text(0.5, 0.5, "─── Combined Best Match ───",
+                        ha="center", va="center", fontsize=10,
+                        color="dimgray", fontweight="bold",
+                        transform=div_ax.transAxes)
+            div_ax.axis("off")
+
+            # combined: primary cam 매칭
+            ax_c = fig.add_subplot(gs[len(cam_list_viz)+1, 0])
+            _draw_matches(ax_c, cam_rgbs.get(mc_primary, query_rgb),
+                          best_ref_rgb, best_mkpts_q, best_mkpts_r, best_confs,
+                          f"[{mc_primary}★ combined] → #{best_cand['id']}  "
+                          f"matches={best_n}  combined={best_score:.2f}\n{match_summary}")
+
+            fig.suptitle(f"Step 6 [{matcher_name}]: best=#{best_cand['id']}  "
+                         f"combined={best_score:.2f}", fontsize=12)
+        else:
+            # ── 단일 캠 기존 레이아웃 ─────────────────────────────────────
+            fig, ax = plt.subplots(1, 1, figsize=(16, 6))
+            match_summary = "  |  ".join(
+                f"R{r+1}:{n}" for r, n in enumerate(all_match_counts))
+            _draw_matches(ax, query_rgb, best_ref_rgb,
+                          best_mkpts_q, best_mkpts_r, best_confs,
+                          f"Step 6 [{matcher_name}]: best=#{best_cand['id']} "
+                          f"({best_n} matches)\n{match_summary}")
+            fig.tight_layout()
+
+        fig.savefig(os.path.join(output_dir, "step6_matching.png"),
+                    dpi=150, bbox_inches="tight"); plt.close()
         print(f"  Saved: step6_matching.png")
 
-        fig2, axes2 = plt.subplots(1, 2, figsize=(14, 4))
+        # ── 점수 바 차트 ─────────────────────────────────────────────────
         colors_bar = ["green" if c["id"] == best_cand["id"] else "steelblue"
                       for c in candidates[:len(all_match_counts)]]
-        xlabels = [f"R{r+1}\n#{c['id']}" for r, c in enumerate(candidates[:len(all_match_counts)])]
+        xlabels = [f"R{r+1}\n#{c['id']}"
+                   for r, c in enumerate(candidates[:len(all_match_counts)])]
+
+        if is_multi and all_cam_scores:
+            cam_ids_viz = list(cam_rgbs.keys())
+            fig2, axes2 = plt.subplots(1, 2, figsize=(14, 4))
+            x = np.arange(len(xlabels))
+            bar_w = 0.8 / (len(cam_ids_viz) + 1)
+            for ci, cid in enumerate(cam_ids_viz):
+                cam_sc = [d.get(cid, 0.0) * cam_weights.get(cid, 1.0)
+                          for d in all_cam_scores]
+                axes2[1].bar(x + ci*bar_w, cam_sc[:len(x)],
+                             width=bar_w, label=f"{cid}(×{cam_weights.get(cid,1):.1f})",
+                             alpha=0.8)
+            combined_sc = all_scores[:len(x)]
+            axes2[1].bar(x + len(cam_ids_viz)*bar_w, combined_sc,
+                         width=bar_w, label="combined", color="red", alpha=0.7)
+            axes2[1].set_xticks(x + bar_w * len(cam_ids_viz) / 2)
+            axes2[1].set_xticklabels(xlabels, fontsize=7)
+            axes2[1].set_ylabel("Weighted score"); axes2[1].legend(fontsize=7)
+            axes2[1].set_title("Per-cam weighted score + combined")
+        else:
+            fig2, axes2 = plt.subplots(1, 2, figsize=(14, 4))
+            axes2[1].bar(xlabels, all_scores, color=colors_bar)
+            axes2[1].set_ylabel("Re-ranking score")
+            axes2[1].set_title("Re-ranking score per candidate")
+
         axes2[0].bar(xlabels, all_match_counts, color=colors_bar)
-        axes2[0].set_ylabel("Match count"); axes2[0].set_title("Match count per candidate")
-        axes2[1].bar(xlabels, all_scores, color=colors_bar)
-        axes2[1].set_ylabel("Re-ranking score")
-        axes2[1].set_title("Re-ranking score per candidate\n(eloftr: conf_sum / vismatch: count)")
-        fig2.suptitle(f"Step 6 [{matcher_name}]: Re-ranking → best=#{best_cand['id']}  "
+        axes2[0].set_ylabel("Match count (primary cam)")
+        axes2[0].set_title("Match count per candidate")
+        fig2.suptitle(f"Step 6 [{matcher_name}]: best=#{best_cand['id']}  "
                       f"score={best_score:.2f}", fontsize=11)
         fig2.tight_layout()
-        fig2.savefig(os.path.join(output_dir, "step6_match_counts.png"), dpi=150); plt.close()
+        fig2.savefig(os.path.join(output_dir, "step6_match_counts.png"),
+                     dpi=150); plt.close()
 
     data = {
         "matched_q_kps":    best_mkpts_q,
@@ -677,6 +908,15 @@ def step6_match(step5_data, config, output_dir, save_images=True):
         "all_scores":       all_scores,
         "candidates":       candidates,
         "matcher_name":     matcher_name,
+        "best_cam_id":      best_cam_id,
+        # multi-cam PnP용: 각 cam의 매칭 결과 + 렌더 entry
+        "cam_mkpts_q":      best_cam_mkpts0,   # {cam_id: query 2D kps}
+        "cam_mkpts_r":      best_cam_mkpts1,   # {cam_id: render 2D kps}
+        "cam_entries":      best_cam_entries,   # {cam_id: render db entry}
+        # 실제 매칭이 된 cam 목록 (step7 multi-PnP에서 사용)
+        "active_cams":      [c for c in (list(cam_rgbs.keys()) if is_multi else [])
+                             if best_cam_n_good.get(c, 0) > 0],
+        "mc_primary":       mc_primary if is_multi else None,
     }
     if save_images:
         pickle.dump(data, open(os.path.join(output_dir, "step6_data.pkl"), "wb"))

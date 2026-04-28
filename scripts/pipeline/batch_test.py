@@ -4,17 +4,31 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .step.step5_retrieval import step5_retrieval
+from .step.step5_retrieval_type2 import step5_retrieval_type2
 from .step.step6_match import step6_match
+from .step.step6_match_type2 import step6_match_type2
 from .step.step7_pnp import step7_pnp
+from .step.multi_cam import load_multi_cam_config, parse_kapture_records, find_sister_images
 
 
-def localize_single(query_image_path, db, config, work_dir, save_images=True):
-    """단일 쿼리 이미지에 대해 step5→step7 파이프라인 실행."""
+def localize_single(query_image_path, db, config, work_dir, save_images=True,
+                    query_images=None):
+    """단일 쿼리 이미지에 대해 step5→step7 파이프라인 실행.
+
+    Args:
+        query_images: multi-cam 모드 시 {cam_id: path} 딕셔너리. None = 단일 캠.
+
+    config.multi_cam.retrieval_type == "type2"이면 step5_retrieval_type2 사용.
+    """
     os.makedirs(work_dir, exist_ok=True)
+    retrieval_type = config.get("multi_cam", {}).get("retrieval_type", "type1")
+    step5_fn = step5_retrieval_type2 if retrieval_type == "type2" else step5_retrieval
+    step6_fn = step6_match_type2 if retrieval_type == "type2" else step6_match
     try:
-        s5 = step5_retrieval(query_image_path, db, config, work_dir,
-                             save_images=save_images)
-        s6 = step6_match(s5, config, work_dir, save_images=save_images)
+        s5 = step5_fn(query_image_path, db, config, work_dir,
+                      save_images=save_images,
+                      query_images=query_images)
+        s6 = step6_fn(s5, config, work_dir, save_images=save_images)
         result = step7_pnp(s6, s5, config, work_dir, save_images=save_images)
         return result.get("estimated_pose") if result else None
     except Exception as e:
@@ -46,6 +60,19 @@ def run_test_batch(test_dir, db, config, output_dir, gt_poses_path=None,
 
     print(f"  Test images: {len(img_paths)} ({test_dir})")
 
+    # ── multi-cam 설정 로드 ───────────────────────────────────────────────
+    mc_enabled, mc_cam_ids, mc_kapture_dir, mc_primary = load_multi_cam_config(config)
+    mc_records = None
+    if mc_enabled:
+        if not os.path.isabs(mc_kapture_dir):
+            mc_kapture_dir = os.path.join(os.getcwd(), mc_kapture_dir)
+        if os.path.exists(mc_kapture_dir):
+            mc_records = parse_kapture_records(mc_kapture_dir)
+            print(f"  Multi-cam enabled: cams={mc_cam_ids}  primary={mc_primary}  "
+                  f"records={len(mc_records)} timestamps")
+        else:
+            print(f"  WARNING: multi_cam.enabled=true but kapture_dir not found: {mc_kapture_dir}")
+
     gt_map = {}
     if gt_poses_path and os.path.exists(gt_poses_path):
         raw = json.load(open(gt_poses_path))
@@ -71,8 +98,19 @@ def run_test_batch(test_dir, db, config, output_dir, gt_poses_path=None,
         work_dir = os.path.join(test_out, os.path.splitext(fname)[0])
         print(f"\n  [{i+1}/{len(img_paths)}] {fname}")
 
+        # multi-cam: 자매 이미지 탐색
+        query_images = None
+        if mc_enabled and mc_records is not None:
+            sisters = find_sister_images(img_path, mc_records, mc_cam_ids)
+            if len(sisters) > 1:
+                query_images = sisters
+            elif sisters:
+                print(f"    multi-cam: only 1 cam found {list(sisters.keys())}, "
+                      "falling back to single-cam")
+
         est_pose = localize_single(img_path, db, config, work_dir,
-                                   save_images=save_images)
+                                   save_images=save_images,
+                                   query_images=query_images)
         est_xyz  = est_pose[:3, 3] if est_pose is not None else None
         gt_xyz   = gt_map.get(fname)
         err      = float(np.linalg.norm(est_xyz - gt_xyz)) \

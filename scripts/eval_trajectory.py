@@ -5,6 +5,9 @@ Trajectory evaluation: predicted (aligned PLY frame) vs GT (kapture frame).
 step0_align에서 PLY를 T_align으로 변환했으므로,
 GT(kapture world frame)를 T_align으로 변환한 뒤 비교한다.
 
+Multi-cam type2의 step7 결과는 rig frame pose로 저장된다. 이 경우 GT camera
+pose도 rigs.txt의 T_rig_to_cam을 사용해 rig pose로 변환한 뒤 비교한다.
+
 Usage:
   python3 scripts/eval_trajectory.py
   python3 scripts/eval_trajectory.py --outlier_thresh 3.0 --cam_id cam_3
@@ -21,11 +24,12 @@ from scipy.spatial.transform import Rotation
 
 
 # ── Default paths ──────────────────────────────────────────────────────────
-STEP0_PKL      = "output/gs_test/step0_data.pkl"
-GT_TRAJ_TXT    = "kapture/sensors/trajectories.txt"
-PRED_TUM_TXT   = "output/gs_test/test_results/cam_3/trajectory_tum.txt"
-OUTPUT_DIR     = "output/gs_test/test_results/cam_3"
-CAM_ID         = "cam_3"
+STEP0_PKL      = "output/sgs_multi_cam_test/step0_data.pkl"
+GT_TRAJ_TXT    = "kapture_1_3/sensors/trajectories.txt"
+RIGS_TXT       = "kapture_1_3/sensors/rigs.txt"
+PRED_TUM_TXT   = "output/sgs_multi_cam_test/test_results/cam_3/trajectory_tum.txt"
+OUTPUT_DIR     = "output/sgs_multi_cam_test/test_results/cam_3"
+CAM_ID         = "cam_3"   # GT를 읽을 카메라 ID
 OUTLIER_THRESH = 5.0   # m — 이 이상의 오차는 outlier로 분류
 
 
@@ -40,6 +44,43 @@ def load_T_align(pkl_path: str) -> np.ndarray:
     print(f"  R_total:\n{T[:3,:3]}")
     print(f"  t_align: {T[:3,3]}")
     return T
+
+
+def load_rig_extrinsic(rigs_path: str, cam_id: str) -> np.ndarray | None:
+    """rigs.txt에서 해당 cam의 T_rig_to_cam (4×4) 로드."""
+    if not os.path.exists(rigs_path):
+        return None
+    with open(rigs_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 9 or parts[1] != cam_id:
+                continue
+            from scipy.spatial.transform import Rotation as _Rot
+            qw, qx, qy, qz = map(float, parts[2:6])
+            tx, ty, tz      = map(float, parts[6:9])
+            R = _Rot.from_quat([qx, qy, qz, qw]).as_matrix()
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3]  = [tx, ty, tz]
+            return T   # T_rig_to_cam
+    return None
+
+
+def to_rig_pose(T_cam: np.ndarray, T_rig_to_cam: np.ndarray) -> np.ndarray:
+    """camera c2w pose를 rig c2w pose로 변환.
+
+    kapture rigs.txt는 현재 코드베이스에서 T_rig_to_cam으로 사용한다.
+    따라서 T_W_rig = T_W_cam @ T_rig_to_cam.
+    """
+    return T_cam @ T_rig_to_cam
+
+
+def rig_to_cam_pose(T_rig: np.ndarray, T_rig_to_cam: np.ndarray) -> np.ndarray:
+    """rig c2w pose를 camera c2w pose로 변환."""
+    return T_rig @ np.linalg.inv(T_rig_to_cam)
 
 
 def load_gt_trajectory(traj_path: str, cam_id: str) -> dict:
@@ -113,9 +154,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--step0_pkl",      default=STEP0_PKL)
     parser.add_argument("--gt_traj",        default=GT_TRAJ_TXT)
+    parser.add_argument("--rigs_txt",       default=RIGS_TXT,
+                        help="kapture rigs.txt 경로. 있으면 GT와 pred 모두 rig frame으로 비교.")
     parser.add_argument("--pred_tum",       default=PRED_TUM_TXT)
     parser.add_argument("--output_dir",     default=OUTPUT_DIR)
-    parser.add_argument("--cam_id",         default=CAM_ID)
+    parser.add_argument("--cam_id",         default=CAM_ID,
+                        help="GT trajectories.txt에서 읽을 카메라 ID")
+    parser.add_argument("--gt_frame",       default="rig",
+                        choices=["cam", "rig"],
+                        help="GT를 비교할 frame. type2 step7 평가는 rig 권장.")
+    parser.add_argument("--pred_frame",     default="rig",
+                        choices=["cam", "rig"],
+                        help="pred_tum pose frame. type2 step7 출력은 rig.")
+    parser.add_argument("--pred_cam_id",    default=None,
+                        help="pred_frame=cam일 때 pred를 rig로 올릴 카메라 ID. 기본값은 cam_id.")
     parser.add_argument("--outlier_thresh", type=float, default=OUTLIER_THRESH,
                         help="이 거리(m) 이상의 오차는 outlier로 제외")
     args = parser.parse_args()
@@ -130,14 +182,61 @@ def main():
     print(f"  GT poses ({args.cam_id}): {len(gt_raw)}")
     print(f"  Pred poses: {len(pred_poses)}")
 
-    # ── Transform GT to aligned frame ─────────────────────────────────────
+    # ── Rig extrinsic 로드 ─────────────────────────────────────────────────
+    pred_cam_id = args.pred_cam_id or args.cam_id
+    T_gt_rig_to_cam = load_rig_extrinsic(args.rigs_txt, args.cam_id)
+    T_pred_rig_to_cam = load_rig_extrinsic(args.rigs_txt, pred_cam_id)
+
+    if args.gt_frame == "rig":
+        if T_gt_rig_to_cam is None:
+            raise FileNotFoundError(
+                f"GT frame=rig requires {args.cam_id} in rigs.txt: {args.rigs_txt}")
+        print(f"  GT rig extrinsic: T_rig_to_{args.cam_id} from {args.rigs_txt}")
+        print(f"    t_rig_to_cam: {T_gt_rig_to_cam[:3,3].round(4)}")
+    else:
+        print(f"  GT frame: camera ({args.cam_id}); no rig conversion")
+
+    if args.pred_frame == "cam":
+        if T_pred_rig_to_cam is None:
+            raise FileNotFoundError(
+                f"pred_frame=cam requires {pred_cam_id} in rigs.txt: {args.rigs_txt}")
+        print(f"  Pred frame: camera ({pred_cam_id}) → converted to rig for comparison")
+    else:
+        print("  Pred frame: rig (type2 step7 default)")
+
+    # ── Transform GT to aligned frame (+ rig frame if requested) ──────────
     # T_align transforms points: p_aligned = T_align @ p_world
     # camera-to-aligned = T_align @ camera-to-world
-    print("\n[2] Transforming GT to aligned frame via T_align...")
-    gt_aligned = {ts: T_align @ T for ts, T in gt_raw.items()}
+    eval_frame = "rig" if args.gt_frame == "rig" else args.cam_id
+    if args.gt_frame != args.pred_frame:
+        print(f"  Frame normalization: pred {args.pred_frame} → GT eval frame {eval_frame}")
+    print(f"\n[2] Transforming trajectories to {eval_frame} + aligned frame...")
+    gt_aligned = {}
+    for ts, T_cam in gt_raw.items():
+        T_cam_aligned = T_align @ T_cam          # cam c2w in aligned world
+        if args.gt_frame == "rig":
+            gt_aligned[ts] = to_rig_pose(T_cam_aligned, T_gt_rig_to_cam)
+        else:
+            gt_aligned[ts] = T_cam_aligned
+
+    if args.pred_frame == args.gt_frame:
+        pred_norm = pred_poses
+    elif args.pred_frame == "cam" and args.gt_frame == "rig":
+        pred_norm = {
+            ts: to_rig_pose(T_pred, T_pred_rig_to_cam)
+            for ts, T_pred in pred_poses.items()
+        }
+    elif args.pred_frame == "rig" and args.gt_frame == "cam":
+        if T_pred_rig_to_cam is None:
+            raise FileNotFoundError(
+                f"pred_frame=rig → gt_frame=cam requires {pred_cam_id} in rigs.txt")
+        pred_norm = {
+            ts: rig_to_cam_pose(T_pred, T_pred_rig_to_cam)
+            for ts, T_pred in pred_poses.items()
+        }
 
     # ── Match timestamps ──────────────────────────────────────────────────
-    common_ts = sorted(set(gt_aligned.keys()) & set(pred_poses.keys()))
+    common_ts = sorted(set(gt_aligned.keys()) & set(pred_norm.keys()))
     print(f"\n[3] Matched timestamps: {len(common_ts)}")
     if len(common_ts) == 0:
         print("  ERROR: No matching timestamps. 타임스탬프 단위를 확인하세요.")
@@ -152,7 +251,7 @@ def main():
 
     for ts in common_ts:
         T_gt   = gt_aligned[ts]
-        T_pred = pred_poses[ts]
+        T_pred = pred_norm[ts]
 
         p_gt   = T_gt[:3, 3]
         p_pred = T_pred[:3, 3]
@@ -183,6 +282,12 @@ def main():
     # ── Print results & save txt ──────────────────────────────────────────
     lines = []
     lines.append(f"{'='*55}")
+    lines.append(f"  GT trajectory      : {args.gt_traj}")
+    lines.append(f"  Pred trajectory    : {args.pred_tum}")
+    lines.append(f"  GT cam/frame       : {args.cam_id} / {args.gt_frame}")
+    lines.append(f"  Pred frame         : {args.pred_frame}"
+                 + (f" ({pred_cam_id})" if args.pred_frame == "cam" else ""))
+    lines.append(f"  Eval frame         : {eval_frame} + aligned map")
     lines.append(f"  Outlier threshold  : {thresh} m")
     lines.append(f"  Total matched      : {n_total}")
     lines.append(f"  Inliers            : {n_inliers}")
@@ -197,6 +302,7 @@ def main():
         lines.append(f"    Std    : {np.std(t_in):.4f} m")
         lines.append(f"    Min    : {np.min(t_in):.4f} m")
         lines.append(f"    Max    : {np.max(t_in):.4f} m")
+        lines.append(f"    @0.10m : {100*np.mean(t_in<=0.10):.1f}%")
         lines.append(f"    @0.25m : {100*np.mean(t_in<=0.25):.1f}%")
         lines.append(f"    @0.50m : {100*np.mean(t_in<=0.50):.1f}%")
         lines.append(f"    @1.00m : {100*np.mean(t_in<=1.00):.1f}%")
@@ -285,7 +391,7 @@ def main():
     ax3.grid(True, alpha=0.3)
 
     if n_inliers > 0:
-        suptitle = (f"cam_3 Trajectory Evaluation  "
+        suptitle = (f"{args.cam_id} Trajectory Evaluation [{eval_frame} frame]  "
                     f"(matched={n_total}, inliers={n_inliers}, outliers={n_outliers})\n"
                     f"Trans — mean={np.mean(t_in):.3f}m  "
                     f"median={np.median(t_in):.3f}m  "
@@ -293,7 +399,7 @@ def main():
                     f"Rot — mean={np.mean(r_in):.1f}°  "
                     f"median={np.median(r_in):.1f}°")
     else:
-        suptitle = "cam_3 Trajectory Evaluation"
+        suptitle = f"{args.cam_id} Trajectory Evaluation [{eval_frame} frame]"
     fig.suptitle(suptitle, fontsize=11)
     fig.tight_layout()
 

@@ -25,12 +25,24 @@ import torch
 from argparse import ArgumentParser
 from tqdm import tqdm
 
-# ── scaffold_gs 경로 ──────────────────────────────────────────────────────────
-_SGS_ROOT = os.path.normpath(
+# ── scaffold_gs 경로: 모델 backup/ 우선, 없으면 third_party/scaffold_gs ──────
+_DEFAULT_SGS_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "third_party", "scaffold_gs")
 )
-if _SGS_ROOT not in sys.path:
-    sys.path.insert(0, _SGS_ROOT)
+
+
+def _ensure_sgs_path(model_path: str = None) -> str:
+    root = _DEFAULT_SGS_ROOT
+    if model_path:
+        backup = os.path.normpath(os.path.join(model_path, "backup"))
+        if os.path.isfile(os.path.join(backup, "scene", "gaussian_model.py")):
+            root = backup
+    # 기존 경로 제거 후 올바른 경로 삽입
+    sys.path[:] = [p for p in sys.path if os.path.normpath(p) != os.path.normpath(_DEFAULT_SGS_ROOT)]
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    print(f"  [SGS] 코드 경로: {root}")
+    return root
 
 
 # ── 모델 로드 (Scene 없이) ─────────────────────────────────────────────────────
@@ -53,6 +65,7 @@ def _read_cfg_args(model_path: str) -> dict:
 
 
 def load_gaussians(model_path: str, iteration: int):
+    _ensure_sgs_path(model_path)
     from scene.gaussian_model import GaussianModel
     from scene import searchForMaxIteration
 
@@ -138,56 +151,82 @@ def load_bake_cameras(model_path: str, num_bake_views: int):
 
 # ── Gaussian baking ───────────────────────────────────────────────────────────
 def bake_gaussians(gaussians, cameras, opacity_threshold: float = 0.005):
-    from gaussian_renderer import generate_neural_gaussians
+    """MLP 직접 호출로 opacity mask 없이 전체 anchor를 일관 처리.
 
-    n_anchors = gaussians.get_anchor.shape[0]
-    all_visible = torch.ones(n_anchors, dtype=torch.bool, device="cuda")
+    핵심 버그 수정:
+    - generate_neural_gaussians 내부 opacity mask → 카메라마다 Gaussian 수 달라짐
+      → shape 불일치 view 전부 skip → 사실상 1장만 baking
+    - mlp_opacity 출력은 raw logit (sigmoid 미적용) → sigmoid 필요
+    - mlp_color 출력은 이미 Sigmoid() 포함 → clamp(0,1)만 하면 OK
+    """
+    anchor      = gaussians.get_anchor      # [N, 3]
+    anchor_feat = gaussians._anchor_feat    # [N, C]
+    offsets     = gaussians._offset         # [N, k, 3]
+    grid_scale  = gaussians.get_scaling     # [N, 6]
+    N, k        = anchor.shape[0], gaussians.n_offsets
+    Nk          = N * k
 
-    color_sum   = None
-    opacity_sum = None
+    anchor_rep   = anchor.unsqueeze(1).expand(-1, k, -1).reshape(Nk, 3)
+    gscale_rep   = grid_scale.unsqueeze(1).expand(-1, k, -1).reshape(Nk, 6)
+    offsets_flat = offsets.reshape(Nk, 3)
+
+    color_logit_sum = torch.zeros(Nk, 3, device="cuda")  # mlp_color has Sigmoid inside
+    opacity_logit_sum = torch.zeros(Nk, 1, device="cuda")  # mlp_opacity: raw logit
     xyz_ref = scaling_ref = rot_ref = None
     count = 0
 
     with torch.no_grad():
         for cam in tqdm(cameras, desc="  Baking"):
             try:
-                xyz, color, opacity, scaling, rot = generate_neural_gaussians(
-                    cam, gaussians, all_visible, is_training=False
-                )
+                ob_view = anchor - cam.camera_center          # [N, 3]
+                ob_dist = ob_view.norm(dim=1, keepdim=True)
+                ob_view = ob_view / (ob_dist + 1e-8)
+                ob_dist = ob_dist / (ob_dist.detach().mean() + 1e-8)
+
+                cat_wd  = torch.cat([anchor_feat, ob_view, ob_dist], dim=1)
+                cat_nod = torch.cat([anchor_feat, ob_view],           dim=1)
+
+                # color: mlp_color 마지막에 Sigmoid() 있음 → [0,1]
+                c_in  = cat_wd if gaussians.add_color_dist else cat_nod
+                color = gaussians.get_color_mlp(c_in).reshape(Nk, 3)
+                color_logit_sum += color.clamp(0, 1)
+
+                # opacity: raw logit → sigmoid 별도 적용 필요
+                o_in    = cat_wd if gaussians.add_opacity_dist else cat_nod
+                opacity = gaussians.get_opacity_mlp(o_in).reshape(Nk, 1)
+                opacity_logit_sum += opacity  # raw logit 누적
+
+                # geometry: 첫 번째 카메라에서만 계산 (view-independent에 가까움)
+                if xyz_ref is None:
+                    s_in      = cat_wd if gaussians.add_cov_dist else cat_nod
+                    scale_rot = gaussians.get_cov_mlp(s_in).reshape(Nk, 7)
+                    xyz_ref     = anchor_rep + offsets_flat * gscale_rep[:, :3]
+                    scaling_ref = gscale_rep[:, 3:] * torch.sigmoid(scale_rot[:, :3])
+                    rot_ref     = gaussians.rotation_activation(scale_rot[:, 3:7])
+
+                count += 1
             except Exception as e:
                 print(f"    skip cam {cam.uid}: {e}")
-                continue
-
-            if color_sum is None:
-                color_sum   = color.clone()
-                opacity_sum = opacity.clone()
-                xyz_ref     = xyz.clone()
-                scaling_ref = scaling.clone()
-                rot_ref     = rot.clone()
-                count = 1
-            elif color.shape[0] == color_sum.shape[0]:
-                color_sum   += color
-                opacity_sum += opacity
-                count += 1
-            # shape mismatch (opacity mask 차이) → skip
 
     if count == 0:
         raise RuntimeError("모든 카메라에서 baking 실패")
 
-    color_avg   = (color_sum   / count).clamp(0.0, 1.0)
-    opacity_avg = (opacity_sum / count).clamp(0.0, 1.0)
+    color_avg   = (color_logit_sum / count).clamp(0.0, 1.0)
+    # opacity: 평균 logit에 sigmoid 적용 → 올바른 [0,1] 확률값
+    opacity_avg = torch.sigmoid(opacity_logit_sum / count)
 
-    # opacity threshold 로 pruning
     mask = (opacity_avg[:, 0] >= opacity_threshold)
-    print(f"  [bake] {count} views 평균, Gaussians: {mask.shape[0]:,} → {mask.sum():,} (opacity≥{opacity_threshold})")
+    print(f"  [bake] {count} views, "
+          f"Gaussians: {Nk:,} → {mask.sum().item():,} (opacity≥{opacity_threshold})")
+    print(f"  scale range: min={scaling_ref[mask].min():.4f}  "
+          f"max={scaling_ref[mask].max():.4f}  "
+          f"mean={scaling_ref[mask].mean():.4f}")
 
-    xyz_np     = xyz_ref[mask].cpu().numpy().astype(np.float32)
-    scaling_np = scaling_ref[mask].cpu().numpy().astype(np.float32)
-    rot_np     = rot_ref[mask].cpu().numpy().astype(np.float32)
-    color_np   = color_avg[mask].cpu().numpy()
-    opacity_np = opacity_avg[mask, 0].cpu().numpy()
-
-    return xyz_np, scaling_np, rot_np, color_np, opacity_np
+    return (xyz_ref[mask].cpu().numpy().astype(np.float32),
+            scaling_ref[mask].cpu().numpy().astype(np.float32),
+            rot_ref[mask].cpu().numpy().astype(np.float32),
+            color_avg[mask].cpu().numpy(),
+            opacity_avg[mask, 0].cpu().numpy())
 
 
 # ── .splat 저장 ───────────────────────────────────────────────────────────────
