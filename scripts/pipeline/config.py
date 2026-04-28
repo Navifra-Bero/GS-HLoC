@@ -50,7 +50,7 @@ def default_config():
             "distance_thresh_ratio": 0.3, "min_floor_points": 100,
             "max_floors": 1, "min_floor_gap": 2.5,
             "max_floor_height": 5.0, "floor_band": 0.3,
-            "sample_mode": "skeleton",
+            "sample_mode": "grid",
             "min_wall_dist_m": 0.3,
             "skel_grid_spacing_m": 0.5,
         },

@@ -5,6 +5,8 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
+from .multi_cam import parse_kapture_rigs, parse_kapture_sensors, load_multi_cam_config
+
 
 # ── PnP solvers ────────────────────────────────────────────────────────────
 
@@ -107,6 +109,102 @@ def _refine_pnp(pts2d_in, pts3d_in, K, rvec_init, tvec_init):
     return rvec_r, tvec_r
 
 
+# ── Multi-cam PnP helper ───────────────────────────────────────────────────
+
+def _lift_2d_to_3d(mkpts_r, ref_entry, K_render, dmin, dmax):
+    """렌더 이미지의 2D 매칭점 → ref cam frame 3D점 (depth lifting)."""
+    dep = np.load(ref_entry["depth_path"])
+    fx_r, fy_r = K_render[0, 0], K_render[1, 1]
+    cx_r, cy_r = K_render[0, 2], K_render[1, 2]
+    pts3d_cam = []
+    valid_idx = []
+    for i, (ru, rv) in enumerate(mkpts_r):
+        ri, rj = int(round(rv)), int(round(ru))
+        if not (0 <= ri < dep.shape[0] and 0 <= rj < dep.shape[1]):
+            continue
+        pz = float(dep[ri, rj])
+        if not np.isfinite(pz) or pz < dmin or pz > dmax:
+            continue
+        pts3d_cam.append([(ru - cx_r) * pz / fx_r,
+                           (rv - cy_r) * pz / fy_r,
+                           pz])
+        valid_idx.append(i)
+    return np.array(pts3d_cam, dtype=np.float64), np.array(valid_idx, dtype=int)
+
+
+def _pnp_cam(mkpts_q, mkpts_r, ref_entry, K_query, K_render, config, cam_id=""):
+    """단일 카메라 PnP 실행.
+
+    Parameters
+    ----------
+    mkpts_q   : (N,2) query 이미지 2D 점 (cam의 실제 intrinsics K_query 기준)
+    mkpts_r   : (N,2) render 이미지 2D 점 (렌더 intrinsics K_render 기준)
+    ref_entry : render DB entry (pose c2w, depth_path)
+    K_query   : 쿼리 카메라 intrinsic matrix (3×3)
+    K_render  : 렌더 intrinsic matrix (3×3) — 3D lifting에 사용
+    config    : pipeline config
+
+    Returns
+    -------
+    c2w_cam   : (4,4) 쿼리 카메라의 c2w (world frame), None if failed
+    inlier_n  : int
+    pts2d     : valid 2D pts (after depth filter)
+    pts3d_cam : valid 3D pts in render cam frame
+    """
+    pnp = config.get("pnp", {})
+    dmin, dmax = float(config["camera"].get("depth_min", 0.3)), \
+                 float(config["camera"].get("depth_max", 20.0))
+    solver    = pnp.get("solver", "opencv").strip().lower()
+    do_refine = bool(pnp.get("refine", True))
+    min_in    = int(pnp.get("min_inliers", 6))
+
+    pts3d_cam, valid_idx = _lift_2d_to_3d(mkpts_r, ref_entry, K_render, dmin, dmax)
+    if len(pts3d_cam) < min_in:
+        return None, 0, np.zeros((0, 2)), pts3d_cam
+
+    pts2d = mkpts_q[valid_idx]
+    T_WR  = np.array(ref_entry["pose"], dtype=np.float64)
+
+    if solver == "superansac":
+        pts3d_h     = np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))])
+        pts3d_world = (T_WR @ pts3d_h.T).T[:, :3]
+        T_WQ_raw, inlier_idx = _solve_pnp_superansac(pts2d, pts3d_world, K_query, config)
+        if T_WQ_raw is None or len(inlier_idx) < min_in:
+            return None, 0, pts2d, pts3d_cam
+        inlier_n = len(inlier_idx)
+        if do_refine:
+            T_RW = np.linalg.inv(T_WR)
+            pts3d_cam_in = (T_RW @ np.hstack([
+                pts3d_world[inlier_idx], np.ones((inlier_n, 1))]).T).T[:, :3]
+            T_QR_init = np.linalg.inv(T_WQ_raw) @ T_WR
+            rvec_i, _  = cv2.Rodrigues(T_QR_init[:3, :3])
+            tvec_i     = T_QR_init[:3, 3].reshape(3, 1)
+            rvec_r, tvec_r = _refine_pnp(pts2d[inlier_idx], pts3d_cam_in, K_query, rvec_i, tvec_i)
+            R_r, _ = cv2.Rodrigues(rvec_r)
+            T_QR_r = np.eye(4); T_QR_r[:3, :3] = R_r; T_QR_r[:3, 3] = tvec_r.flatten()
+            c2w_cam = T_WR @ np.linalg.inv(T_QR_r)
+        else:
+            c2w_cam = T_WQ_raw
+    else:  # opencv
+        T_QR_raw, rvec, inlier_idx = _solve_pnp_opencv(pts2d, pts3d_cam, K_query, config)
+        if T_QR_raw is None or len(inlier_idx) < min_in:
+            return None, 0, pts2d, pts3d_cam
+        inlier_n = len(inlier_idx)
+        T_QR = T_QR_raw
+        if do_refine:
+            rvec_r, tvec_r = _refine_pnp(
+                pts2d[inlier_idx], pts3d_cam[inlier_idx], K_query, rvec,
+                T_QR_raw[:3, 3].reshape(3, 1))
+            R_r, _ = cv2.Rodrigues(rvec_r)
+            T_QR = np.eye(4); T_QR[:3, :3] = R_r; T_QR[:3, 3] = tvec_r.flatten()
+        c2w_cam = T_WR @ np.linalg.inv(T_QR)
+
+    label = f"[{cam_id}] " if cam_id else ""
+    print(f"  {label}PnP {solver}: {inlier_n}/{len(pts2d)} inliers  "
+          f"pos={c2w_cam[:3,3].round(3)}")
+    return c2w_cam, inlier_n, pts2d, pts3d_cam
+
+
 # ── Main step ──────────────────────────────────────────────────────────────
 
 def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
@@ -127,116 +225,242 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
     fx, fy = cam["fx"], cam["fy"]
     cx, cy = cam["cx"], cam["cy"]
     K      = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-    dmin   = cam.get("depth_min", 0.3)
-    dmax   = cam.get("depth_max", 20.0)
 
     solver    = pnp.get("solver", "opencv").strip().lower()
     do_refine = bool(pnp.get("refine", True))
     min_in    = int(pnp.get("min_inliers", 6))
 
-    matched_q = step6_data["matched_q_kps"]
-    matched_r = step6_data["matched_r_kps"]
     ref_entry = step6_data["best_cand"]
     query_rgb = step6_data["query_rgb"]
     ref_rgb   = step6_data["ref_rgb"]
     gt_entry  = step5_data.get("gt_entry")
+    T_WR      = np.array(ref_entry["pose"], dtype=np.float64)
 
-    dep  = np.load(ref_entry["depth_path"])
-    T_WR = np.array(ref_entry["pose"], dtype=np.float64)
+    # K_render: 렌더는 항상 config camera 파라미터로 생성
+    K_render = K
 
-    # ── 2D-3D lifting (ref camera frame) ──────────────────────────────
-    pts2d = []; pts3d_cam = []; invalid = 0
-    for i in range(len(matched_q)):
-        qu, qv = matched_q[i]
-        ru, rv = matched_r[i]
-        ri, rj = int(round(rv)), int(round(ru))
-        if not (0 <= ri < dep.shape[0] and 0 <= rj < dep.shape[1]):
-            invalid += 1; continue
-        pz = float(dep[ri, rj])
-        if not np.isfinite(pz) or pz < dmin or pz > dmax:
-            invalid += 1; continue
-        pts2d.append([qu, qv])
-        pts3d_cam.append([(ru - cx) * pz / fx,
-                           (rv - cy) * pz / fy,
-                           pz])
-
-    pts2d     = np.array(pts2d,     dtype=np.float64)
-    pts3d_cam = np.array(pts3d_cam, dtype=np.float64)
-
-    print(f"  Matched pairs      : {len(matched_q)}")
-    print(f"  Valid (depth OK)   : {len(pts2d)}  (depth invalid: {invalid})")
-    print(f"  Ref pose           : {T_WR[:3, 3].round(3)}")
-    print(f"  Solver             : {solver}  refine={do_refine}")
+    # ── Multi-cam PnP ────────────────────────────────────────────────────
+    active_cams = step6_data.get("active_cams", [])
+    cam_mkpts_q = step6_data.get("cam_mkpts_q", {})
+    cam_mkpts_r = step6_data.get("cam_mkpts_r", {})
+    cam_entries = step6_data.get("cam_entries", {})
+    mc_primary  = (step6_data.get("mc_primary")
+                   or config.get("multi_cam", {}).get("primary_cam", ""))
+    is_multi_pnp = len(active_cams) > 1 and bool(cam_entries)
 
     estimated_pose = None
     inlier_count   = 0
-    T_QR           = None
+    T_QR           = None   # single-cam only
+    pts2d          = np.zeros((0, 2))
+    pts3d_cam      = np.zeros((0, 3))
 
-    if len(pts2d) < min_in:
-        print(f"  PnP SKIPPED: {len(pts2d)} < {min_in} correspondences")
+    if is_multi_pnp:
+        # ── 각 카메라 독립 PnP → rig frame 통일 → 최고 inlier 선택 ──────
+        _, _, kapture_dir, _ = load_multi_cam_config(config)
+        if not os.path.isabs(kapture_dir):
+            kapture_dir = os.path.join(os.getcwd(), kapture_dir)
 
-    elif solver == "superansac":
-        # ref cam → world frame
-        pts3d_h     = np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))])
-        pts3d_world = (T_WR @ pts3d_h.T).T[:, :3]
+        rigs    = parse_kapture_rigs(kapture_dir)     # {cam_id: T_rig_to_cam}
+        sensors = parse_kapture_sensors(kapture_dir)  # {cam_id: {fx,fy,cx,cy,...}}
 
-        T_WQ_raw, inlier_idx = _solve_pnp_superansac(
-            pts2d, pts3d_world, K, config)
+        print(f"  Mode: multi-cam PnP  active={active_cams}  primary={mc_primary}")
+        print(f"  Solver: {solver}  refine={do_refine}")
 
-        if T_WQ_raw is not None and len(inlier_idx) >= min_in:
-            inlier_count = len(inlier_idx)
+        pnp_results = {}  # {cam_id: (c2w_rig, n_inliers)}
+        best_inliers = 0
+        best_cam_id  = None
 
-            if do_refine:
-                # world → ref cam frame으로 변환 후 ITERATIVE refine
-                T_RW = np.linalg.inv(T_WR)
-                pts3d_cam_in = (T_RW @ np.hstack([
-                    pts3d_world[inlier_idx],
-                    np.ones((inlier_count, 1))]).T).T[:, :3]
-                pts2d_in = pts2d[inlier_idx]
-                # T_WQ = T_WR @ inv(T_QR)  →  T_QR = inv(T_WQ) @ T_WR
-                T_QR_init = np.linalg.inv(T_WQ_raw) @ T_WR
-                rvec_init, _ = cv2.Rodrigues(T_QR_init[:3, :3])
-                tvec_init    = T_QR_init[:3, 3].reshape(3, 1)
-                rvec_r, tvec_r = _refine_pnp(
-                    pts2d_in, pts3d_cam_in, K, rvec_init, tvec_init)
-                R_r, _ = cv2.Rodrigues(rvec_r)
-                T_QR_r = np.eye(4)
-                T_QR_r[:3, :3] = R_r
-                T_QR_r[:3, 3]  = tvec_r.flatten()
-                estimated_pose = T_WR @ np.linalg.inv(T_QR_r)
-                print(f"  Refine applied (SuperANSAC → ITERATIVE)")
+        for cam_id in active_cams:
+            if cam_id not in cam_mkpts_q or cam_id not in cam_entries:
+                continue
+            mq = cam_mkpts_q[cam_id]
+            mr = cam_mkpts_r[cam_id]
+            if len(mq) == 0:
+                continue
+
+            # 카메라별 intrinsics
+            s = sensors.get(cam_id)
+            if s:
+                K_q = np.array([[s["fx"], 0, s["cx"]],
+                                 [0, s["fy"], s["cy"]],
+                                 [0, 0, 1]], dtype=np.float64)
             else:
-                estimated_pose = T_WQ_raw
+                K_q = K_render
+                print(f"    [{cam_id}] sensors.txt 미존재 → config K 사용")
 
-            print(f"  SuperANSAC SUCCESS: {inlier_count}/{len(pts2d)} inliers")
-            print(f"  T_WQ position: {estimated_pose[:3, 3].round(4)}")
+            c2w_cam, n_in, p2d, p3d = _pnp_cam(
+                mq, mr, cam_entries[cam_id], K_q, K_render, config, cam_id)
+
+            if cam_id == mc_primary:
+                pts2d, pts3d_cam = p2d, p3d  # 시각화용
+
+            if c2w_cam is None:
+                print(f"    [{cam_id}] PnP FAILED")
+                pnp_results[cam_id] = (None, 0)
+                continue
+
+            # cam c2w → rig c2w:  T_WQ_rig = c2w_cam @ T_rig_to_cam
+            T_rig_to_cam = rigs.get(cam_id)
+            if T_rig_to_cam is not None:
+                c2w_rig = c2w_cam @ T_rig_to_cam
+            else:
+                c2w_rig = c2w_cam
+                print(f"    [{cam_id}] rigs.txt 미존재 → cam pose 그대로 사용")
+
+            pnp_results[cam_id] = (c2w_rig, n_in)
+            print(f"    [{cam_id}] rig pos={c2w_rig[:3,3].round(3)}  inliers={n_in}")
+
+            if n_in > best_inliers:
+                best_inliers = n_in
+                estimated_pose = c2w_rig
+                best_cam_id    = cam_id
+
+        if estimated_pose is not None:
+            inlier_count = best_inliers
+            print(f"  Multi-cam PnP BEST: cam={best_cam_id}  {inlier_count} inliers")
+            print(f"  Rig position: {estimated_pose[:3,3].round(4)}")
+
+            # 카메라 간 일관성 체크
+            ok_poses = [(cid, r) for cid, r in pnp_results.items() if r[0] is not None]
+            if len(ok_poses) > 1:
+                print("  Consistency check:")
+                for cid, (c2w_r, n) in ok_poses:
+                    d = np.linalg.norm(c2w_r[:3,3] - estimated_pose[:3,3])
+                    flag = "✓" if d < 0.5 else "✗ inconsistent"
+                    print(f"    [{cid}] dist_to_best={d:.3f}m  {flag}  ({n} inliers)")
         else:
-            print("  SuperANSAC FAILED: insufficient inliers")
+            print("  Multi-cam PnP 전 cam 실패 → single-cam fallback")
+            is_multi_pnp = False
 
-    else:  # opencv
-        T_QR_raw, rvec, inlier_idx = _solve_pnp_opencv(pts2d, pts3d_cam, K, config)
+    if not is_multi_pnp:
+        # ── 단일 캠 경로 ─────────────────────────────────────────────────
+        matched_q   = step6_data["matched_q_kps"]
+        matched_r   = step6_data["matched_r_kps"]
+        _pnp_cam_id = step6_data.get("best_cam_id") or step6_data.get("mc_primary")
+        dmin = cam.get("depth_min", 0.3)
+        dmax = cam.get("depth_max", 20.0)
 
-        if T_QR_raw is not None and len(inlier_idx) >= min_in:
-            inlier_count = len(inlier_idx)
-            T_QR = T_QR_raw
+        # ref_entry/T_WR: pnp_cam의 실제 렌더 entry 사용
+        # sub cam fallback 시 best_cand(primary 렌더)와 matched_r의 렌더가 다를 수 있음
+        _cam_entries = step6_data.get("cam_entries", {})
+        if _pnp_cam_id and _pnp_cam_id in _cam_entries:
+            ref_entry = _cam_entries[_pnp_cam_id]
+            T_WR      = np.array(ref_entry["pose"], dtype=np.float64)
+            print(f"  Ref entry: [{_pnp_cam_id}] render #{ref_entry['id']}")
 
-            if do_refine:
-                pts2d_in     = pts2d[inlier_idx]
-                pts3d_cam_in = pts3d_cam[inlier_idx]
-                tvec_init    = T_QR_raw[:3, 3].reshape(3, 1)
-                rvec_r, tvec_r = _refine_pnp(
-                    pts2d_in, pts3d_cam_in, K, rvec, tvec_init)
-                R_r, _ = cv2.Rodrigues(rvec_r)
-                T_QR = np.eye(4)
-                T_QR[:3, :3] = R_r
-                T_QR[:3, 3]  = tvec_r.flatten()
-                print(f"  Refine applied (EPnP → ITERATIVE)")
+        # K_render: 렌더 intrinsic (항상 config 파라미터)
+        # K_query : 실제 쿼리 cam intrinsic (sensors.txt 우선, fallback = config K)
+        K_render = K
+        K_query  = K
+        if _pnp_cam_id:
+            _, _, _kap_dir, _ = load_multi_cam_config(config)
+            if not os.path.isabs(_kap_dir):
+                _kap_dir = os.path.join(os.getcwd(), _kap_dir)
+            if os.path.isdir(_kap_dir):
+                _sensors = parse_kapture_sensors(_kap_dir)
+                s = _sensors.get(_pnp_cam_id)
+                if s:
+                    K_query = np.array([[s["fx"], 0, s["cx"]],
+                                        [0, s["fy"], s["cy"]],
+                                        [0, 0, 1]], dtype=np.float64)
+                    print(f"  Query cam [{_pnp_cam_id}] K from sensors.txt: "
+                          f"fx={s['fx']:.1f}  fy={s['fy']:.1f}  "
+                          f"cx={s['cx']:.1f}  cy={s['cy']:.1f}")
 
-            estimated_pose = T_WR @ np.linalg.inv(T_QR)
-            print(f"  OpenCV PnP SUCCESS: {inlier_count}/{len(pts2d)} inliers")
-            print(f"  T_WQ position: {estimated_pose[:3, 3].round(4)}")
-        else:
-            print("  OpenCV PnP FAILED: insufficient inliers")
+        dep = np.load(ref_entry["depth_path"])
+        # 3D lifting은 K_render 사용 (렌더는 항상 config 파라미터로 생성)
+        pts2d_list = []; pts3d_list = []; invalid = 0
+        for i in range(len(matched_q)):
+            qu, qv = matched_q[i]
+            ru, rv = matched_r[i]
+            ri, rj = int(round(rv)), int(round(ru))
+            if not (0 <= ri < dep.shape[0] and 0 <= rj < dep.shape[1]):
+                invalid += 1; continue
+            pz = float(dep[ri, rj])
+            if not np.isfinite(pz) or pz < dmin or pz > dmax:
+                invalid += 1; continue
+            pts2d_list.append([qu, qv])
+            pts3d_list.append([(ru - K_render[0,2]) * pz / K_render[0,0],
+                                (rv - K_render[1,2]) * pz / K_render[1,1],
+                                pz])
+
+        pts2d     = np.array(pts2d_list,  dtype=np.float64)
+        pts3d_cam = np.array(pts3d_list,  dtype=np.float64)
+
+        print(f"  Matched pairs      : {len(matched_q)}")
+        print(f"  Valid (depth OK)   : {len(pts2d)}  (invalid: {invalid})")
+        print(f"  Ref pose           : {T_WR[:3,3].round(3)}")
+        print(f"  Solver             : {solver}  refine={do_refine}")
+
+        if len(pts2d) < min_in:
+            print(f"  PnP SKIPPED: {len(pts2d)} < {min_in} correspondences")
+
+        elif solver == "superansac":
+            pts3d_h     = np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))])
+            pts3d_world = (T_WR @ pts3d_h.T).T[:, :3]
+            T_WQ_raw, inlier_idx = _solve_pnp_superansac(
+                pts2d, pts3d_world, K_query, config)
+
+            if T_WQ_raw is not None and len(inlier_idx) >= min_in:
+                inlier_count = len(inlier_idx)
+                if do_refine:
+                    T_RW = np.linalg.inv(T_WR)
+                    pts3d_cam_in = (T_RW @ np.hstack([
+                        pts3d_world[inlier_idx], np.ones((inlier_count, 1))]).T).T[:, :3]
+                    T_QR_init = np.linalg.inv(T_WQ_raw) @ T_WR
+                    rvec_i, _ = cv2.Rodrigues(T_QR_init[:3, :3])
+                    tvec_i    = T_QR_init[:3, 3].reshape(3, 1)
+                    rvec_r, tvec_r = _refine_pnp(
+                        pts2d[inlier_idx], pts3d_cam_in, K_query, rvec_i, tvec_i)
+                    R_r, _ = cv2.Rodrigues(rvec_r)
+                    T_QR_r = np.eye(4); T_QR_r[:3, :3] = R_r; T_QR_r[:3, 3] = tvec_r.flatten()
+                    estimated_pose = T_WR @ np.linalg.inv(T_QR_r)
+                    print(f"  Refine applied (SuperANSAC → ITERATIVE)")
+                else:
+                    estimated_pose = T_WQ_raw
+                print(f"  SuperANSAC SUCCESS: {inlier_count}/{len(pts2d)} inliers")
+                print(f"  T_WQ position: {estimated_pose[:3,3].round(4)}")
+            else:
+                print("  SuperANSAC FAILED: insufficient inliers")
+
+        else:  # opencv
+            T_QR_raw, rvec, inlier_idx = _solve_pnp_opencv(
+                pts2d, pts3d_cam, K_query, config)
+            if T_QR_raw is not None and len(inlier_idx) >= min_in:
+                inlier_count = len(inlier_idx)
+                T_QR = T_QR_raw
+                if do_refine:
+                    rvec_r, tvec_r = _refine_pnp(
+                        pts2d[inlier_idx], pts3d_cam[inlier_idx], K_query, rvec,
+                        T_QR_raw[:3, 3].reshape(3, 1))
+                    R_r, _ = cv2.Rodrigues(rvec_r)
+                    T_QR = np.eye(4); T_QR[:3, :3] = R_r; T_QR[:3, 3] = tvec_r.flatten()
+                    print(f"  Refine applied (EPnP → ITERATIVE)")
+                estimated_pose = T_WR @ np.linalg.inv(T_QR)
+                print(f"  OpenCV PnP SUCCESS: {inlier_count}/{len(pts2d)} inliers")
+                print(f"  T_WQ position: {estimated_pose[:3,3].round(4)}")
+            else:
+                print("  OpenCV PnP FAILED: insufficient inliers")
+
+    # ── Rig frame 정규화 (single-cam 경로) ──────────────────────────────────
+    # multi-cam PnP 경로는 이미 rig frame으로 변환됨.
+    # single-cam 경로는 해당 cam의 c2w이므로 rig frame으로 변환해야
+    # eval에서 카메라 간 frame 불일치 없이 비교 가능.
+    if estimated_pose is not None and not is_multi_pnp:
+        # best_cam_id = step6에서 실제 PnP에 사용된 cam (매칭 수 최대)
+        # mc_primary  = avg_sim 기준 primary (실제 사용 cam과 다를 수 있음)
+        _used_cam = step6_data.get("best_cam_id") or step6_data.get("mc_primary")
+        if _used_cam:
+            _, _, _kap_dir, _ = load_multi_cam_config(config)
+            if not os.path.isabs(_kap_dir):
+                _kap_dir = os.path.join(os.getcwd(), _kap_dir)
+            if os.path.isdir(_kap_dir):
+                _rigs = parse_kapture_rigs(_kap_dir)
+                _T_rc = _rigs.get(_used_cam)
+                if _T_rc is not None:
+                    # c2w_rig = c2w_cam @ T_rig_to_cam
+                    estimated_pose = estimated_pose @ _T_rc
+                    print(f"  → rig frame (cam={_used_cam})")
 
     if gt_entry is not None and estimated_pose is not None:
         err = np.linalg.norm(

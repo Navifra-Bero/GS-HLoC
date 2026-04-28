@@ -21,11 +21,12 @@ from scipy.spatial.transform import Rotation
 
 
 # ── Default paths ──────────────────────────────────────────────────────────
-STEP0_PKL      = "output/gs_test/step0_data.pkl"
+STEP0_PKL      = "output/sgs_multi_cam_test/step0_data.pkl"
 GT_TRAJ_TXT    = "kapture/sensors/trajectories.txt"
-PRED_TUM_TXT   = "output/gs_test/test_results/cam_3/trajectory_tum.txt"
-OUTPUT_DIR     = "output/gs_test/test_results/cam_3"
-CAM_ID         = "cam_3"
+RIGS_TXT       = "kapture/sensors/rigs.txt"   # cam → rig extrinsic
+PRED_TUM_TXT   = "output/sgs_multi_cam_test/test_results/cam_3/trajectory_tum.txt"
+OUTPUT_DIR     = "output/sgs_multi_cam_test/test_results/cam_3"
+CAM_ID         = "cam_3"   # GT를 읽을 카메라 ID
 OUTLIER_THRESH = 5.0   # m — 이 이상의 오차는 outlier로 분류
 
 
@@ -40,6 +41,31 @@ def load_T_align(pkl_path: str) -> np.ndarray:
     print(f"  R_total:\n{T[:3,:3]}")
     print(f"  t_align: {T[:3,3]}")
     return T
+
+
+def load_rig_extrinsic(rigs_path: str, cam_id: str) -> np.ndarray | None:
+    """rigs.txt에서 해당 cam의 T_rig_to_cam (4×4) 로드.
+    없으면 None 반환.
+    """
+    if not os.path.exists(rigs_path):
+        return None
+    with open(rigs_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 9 or parts[1] != cam_id:
+                continue
+            from scipy.spatial.transform import Rotation as _Rot
+            qw, qx, qy, qz = map(float, parts[2:6])
+            tx, ty, tz      = map(float, parts[6:9])
+            R = _Rot.from_quat([qx, qy, qz, qw]).as_matrix()
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3]  = [tx, ty, tz]
+            return T   # T_rig_to_cam
+    return None
 
 
 def load_gt_trajectory(traj_path: str, cam_id: str) -> dict:
@@ -113,9 +139,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--step0_pkl",      default=STEP0_PKL)
     parser.add_argument("--gt_traj",        default=GT_TRAJ_TXT)
+    parser.add_argument("--rigs_txt",       default=RIGS_TXT,
+                        help="kapture rigs.txt 경로. 있으면 GT와 pred 모두 rig frame으로 비교.")
     parser.add_argument("--pred_tum",       default=PRED_TUM_TXT)
     parser.add_argument("--output_dir",     default=OUTPUT_DIR)
-    parser.add_argument("--cam_id",         default=CAM_ID)
+    parser.add_argument("--cam_id",         default=CAM_ID,
+                        help="GT trajectories.txt에서 읽을 카메라 ID")
     parser.add_argument("--outlier_thresh", type=float, default=OUTLIER_THRESH,
                         help="이 거리(m) 이상의 오차는 outlier로 제외")
     args = parser.parse_args()
@@ -130,11 +159,31 @@ def main():
     print(f"  GT poses ({args.cam_id}): {len(gt_raw)}")
     print(f"  Pred poses: {len(pred_poses)}")
 
-    # ── Transform GT to aligned frame ─────────────────────────────────────
+    # ── Rig extrinsic 로드 ─────────────────────────────────────────────────
+    # pred는 step7에서 이미 rig frame으로 저장됨.
+    # GT도 rig frame으로 변환해야 frame이 일치함.
+    # c2w_rig = c2w_cam @ T_rig_to_cam
+    T_rig_to_cam = load_rig_extrinsic(args.rigs_txt, args.cam_id)
+    if T_rig_to_cam is not None:
+        print(f"  Rigs loaded ({args.rigs_txt}): T_rig_to_{args.cam_id} applied to GT")
+        print(f"    t_rig_to_cam: {T_rig_to_cam[:3,3].round(4)}")
+    else:
+        print(f"  Rigs: not found or cam_id not in rigs.txt → GT stays in {args.cam_id} frame")
+
+    # ── Transform GT to aligned frame (+ rig frame if available) ──────────
     # T_align transforms points: p_aligned = T_align @ p_world
     # camera-to-aligned = T_align @ camera-to-world
-    print("\n[2] Transforming GT to aligned frame via T_align...")
-    gt_aligned = {ts: T_align @ T for ts, T in gt_raw.items()}
+    print(f"\n[2] Transforming GT to {'rig' if T_rig_to_cam is not None else args.cam_id} "
+          f"+ aligned frame via T_align...")
+    gt_aligned = {}
+    for ts, T_cam in gt_raw.items():
+        T_cam_aligned = T_align @ T_cam          # cam c2w in aligned world
+        if T_rig_to_cam is not None:
+            # c2w_rig = c2w_cam @ T_rig_to_cam
+            T_rig_aligned = T_cam_aligned @ T_rig_to_cam
+            gt_aligned[ts] = T_rig_aligned
+        else:
+            gt_aligned[ts] = T_cam_aligned
 
     # ── Match timestamps ──────────────────────────────────────────────────
     common_ts = sorted(set(gt_aligned.keys()) & set(pred_poses.keys()))
@@ -197,6 +246,7 @@ def main():
         lines.append(f"    Std    : {np.std(t_in):.4f} m")
         lines.append(f"    Min    : {np.min(t_in):.4f} m")
         lines.append(f"    Max    : {np.max(t_in):.4f} m")
+        lines.append(f"    @0.10m : {100*np.mean(t_in<=0.10):.1f}%")
         lines.append(f"    @0.25m : {100*np.mean(t_in<=0.25):.1f}%")
         lines.append(f"    @0.50m : {100*np.mean(t_in<=0.50):.1f}%")
         lines.append(f"    @1.00m : {100*np.mean(t_in<=1.00):.1f}%")

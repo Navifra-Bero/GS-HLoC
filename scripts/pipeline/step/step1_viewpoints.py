@@ -86,7 +86,7 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
           f"(max_floors={max_floors}, min_gap={min_gap}m, max_h={max_fh}m)")
 
     gr = samp.get("grid_resolution", 0.05)
-    ps = samp.get("path_spacing", 0.5)
+    ps = samp.get("path_spacing", 0.8)
     ch = samp.get("height_above_floor", 1.2)
     ny = samp.get("num_yaw_angles", 4)
     # height_offsets_m: 기준 높이(ch)에서의 오프셋 목록 (미터)
@@ -95,8 +95,8 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
     print(f"  Height offsets: {height_offsets} m")
     mk = samp.get("morph_kernel_size", 5)
     dr = samp.get("distance_thresh_ratio", 0.3)
-    sample_mode = samp.get("sample_mode", "skeleton")   # "skeleton" or "grid"
-    skel_grid_spacing_m = samp.get("skel_grid_spacing_m", 0.5)
+    sample_mode = samp.get("sample_mode", "grid")   # "skeleton" or "grid"
+    skel_grid_spacing_m = samp.get("skel_grid_spacing_m", 0.8)
     all_vp = []; debug_imgs = {}; vid = 0
 
     for fi, fz in enumerate(floors):

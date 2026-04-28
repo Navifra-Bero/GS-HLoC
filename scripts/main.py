@@ -25,6 +25,7 @@ from pipeline import (
     step6_match_dedode, step6a_match_viz_dedode,
     step7_pnp,
     run_test_batch,
+    load_multi_cam_config, parse_kapture_records, find_sister_images,
     OFFLINE_STEPS, ONLINE_STEPS, STEPS,
 )
 
@@ -66,6 +67,9 @@ def main():
                         help="scaffold_gs 렌더 시 PLY 비교 렌더를 저장하지 않음 (기본: 저장).")
     parser.add_argument("--sgs_no_ply_depth", action="store_true", default=False,
                         help="scaffold_gs 렌더 시 GS depth가 없을 때 aligned PLY depth fallback을 저장하지 않음 (기본: 저장).")
+    parser.add_argument("--sgs_ckpt", default=None,
+                        help="scaffold_gs .pth 체크포인트 경로 직접 지정 (예: --sgs_ckpt path/to/chkpnt_best.pth). "
+                             "지정 시 --sgs_iteration 무시. 생략 시 자동 결정 (chkpnt_best.json → max iteration).")
 
     # GS-specific options
     parser.add_argument("--kapture_dir", default="kapture/sensors",
@@ -114,6 +118,7 @@ def main():
                 step0_data=s0,
                 sgs_model_path=args.sgs_model_path,
                 sgs_iteration=args.sgs_iteration,
+                sgs_ckpt_path=args.sgs_ckpt,
                 use_train_cameras=args.sgs_use_train_cameras,
                 save_ply_compare=not args.sgs_no_ply_compare,
                 save_ply_depth=not args.sgs_no_ply_depth,
@@ -208,9 +213,31 @@ def main():
         return
 
     # ── Online single query ───────────────────────────────────────────
+    # multi-cam: kapture records 로드 (enabled 시)
+    _mc_enabled, _mc_cam_ids, _mc_kapture_dir, _mc_primary = load_multi_cam_config(config)
+    _mc_records = None
+    if _mc_enabled:
+        if not os.path.isabs(_mc_kapture_dir):
+            _mc_kapture_dir = os.path.join(os.getcwd(), _mc_kapture_dir)
+        if os.path.exists(_mc_kapture_dir):
+            _mc_records = parse_kapture_records(_mc_kapture_dir)
+            print(f"  Multi-cam: cams={_mc_cam_ids}  primary={_mc_primary}  "
+                  f"records={len(_mc_records)} timestamps")
+        else:
+            print(f"  WARNING: multi_cam enabled but kapture_dir not found: {_mc_kapture_dir}")
+
+    def _build_query_images(query_path):
+        """query_path에 대한 multi-cam {cam_id: path} 딕셔너리 반환."""
+        if not _mc_enabled or _mc_records is None or not query_path:
+            return None
+        sisters = find_sister_images(query_path, _mc_records, _mc_cam_ids)
+        return sisters if len(sisters) > 1 else None
+
     s5 = None
     if run_online or args.step == "5_retrieval":
-        s5 = step5_retrieval(args.query_image, db, config, args.output_dir)
+        _qimgs = _build_query_images(args.query_image)
+        s5 = step5_retrieval(args.query_image, db, config, args.output_dir,
+                             query_images=_qimgs)
     elif args.step in ("6_match", "6_match_dedode", "7_pnp"):
         s5 = load_pkl(args.output_dir, "step5_data.pkl")
         if s5 is None:
