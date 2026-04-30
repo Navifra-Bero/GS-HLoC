@@ -35,7 +35,7 @@ def main():
     parser = argparse.ArgumentParser(description="RenderLoc Pipeline")
     parser.add_argument("--ply_map",    required=True)
     parser.add_argument("--config",     default="config/render_loc.yaml")
-    parser.add_argument("--output_dir", default="output/gs_test")
+    parser.add_argument("--output_dir", default="output/colmap_sgs_test")
     parser.add_argument("--step",       default="all",
                         choices=["all", "offline", "online", "test"] + STEPS)
     parser.add_argument("--query_image", default=None,

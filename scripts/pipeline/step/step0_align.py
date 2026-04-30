@@ -5,6 +5,28 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+_AXIS_VECTORS = {
+    "x":     np.array([ 1.0,  0.0,  0.0]),
+    "x_neg": np.array([-1.0,  0.0,  0.0]),
+    "y":     np.array([ 0.0,  1.0,  0.0]),
+    "y_neg": np.array([ 0.0, -1.0,  0.0]),
+    "z":     np.array([ 0.0,  0.0,  1.0]),
+    "z_neg": np.array([ 0.0,  0.0, -1.0]),
+}
+
+
+def _axis_to_z_rotation(up_axis_key):
+    up = _AXIS_VECTORS[up_axis_key.lower()]
+    z  = np.array([0.0, 0.0, 1.0])
+    v  = np.cross(up, z)
+    s  = np.linalg.norm(v)
+    c  = float(np.dot(up, z))
+    if s < 1e-6:
+        return np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    vx = np.array([[0,-v[2],v[1]],[v[2],0,-v[0]],[-v[1],v[0],0]])
+    return np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+
+
 def step0_align(ply_path, config, output_dir):
     """
     PLY 맵의 바닥 평면을 RANSAC으로 찾아서 중력 방향(Z-up)으로 정렬.
@@ -28,12 +50,18 @@ def step0_align(ply_path, config, output_dir):
     has_color = pcd.has_colors()
     print(f"  Loaded: {len(points_orig)} points, color={has_color}")
 
-    # X축(오른쪽) 기준 180° 회전 — Y,Z 반전 (책장 넘기듯)
-    R_flip = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float64)
+    # 입력 PLY의 "위(중력 반대)" 방향을 +Z로 가져오는 사전 회전
+    # config: alignment.up_axis ∈ {x, x_neg, y, y_neg, z, z_neg}
+    #   - 기본 LiDAR 컨벤션: "z_neg" (원래 동작과 동일)
+    #   - COLMAP 표준: "y_neg"
+    up_axis = align_cfg.get("up_axis", "z_neg")
+    if up_axis.lower() not in _AXIS_VECTORS:
+        raise ValueError(f"alignment.up_axis must be one of {list(_AXIS_VECTORS.keys())}, got {up_axis!r}")
+    R_flip = _axis_to_z_rotation(up_axis)
     pcd.points = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.points).T).T)
     if pcd.has_normals():
         pcd.normals = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.normals).T).T)
-    print("  Pre-flip: 180° around Z axis (X,Y 반전)")
+    print(f"  Pre-rotation: up_axis={up_axis} → +Z")
 
     if not pcd.has_normals():
         print("  Computing normals...")

@@ -86,16 +86,17 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
           f"(max_floors={max_floors}, min_gap={min_gap}m, max_h={max_fh}m)")
 
     gr = samp.get("grid_resolution", 0.05)
-    ps = samp.get("path_spacing", 0.8)
+    ps = samp.get("path_spacing", 0.5)
     ch = samp.get("height_above_floor", 1.2)
     ny = samp.get("num_yaw_angles", 4)
     # height_offsets_m: 기준 높이(ch)에서의 오프셋 목록 (미터)
     # e.g. [0.0, -0.2, 0.2] → 기준 / 20cm 아래 / 20cm 위
     height_offsets = list(samp.get("height_offsets_m", [0.0, -0.2, 0.2]))
     print(f"  Height offsets: {height_offsets} m")
-    mk = samp.get("morph_kernel_size", 5)
-    dr = samp.get("distance_thresh_ratio", 0.3)
-    sample_mode = samp.get("sample_mode", "grid")   # "skeleton" or "grid"
+    mk = samp.get("morph_kernel_size", 3)
+    mi = samp.get("morph_iterations", 4)
+    dr = samp.get("distance_thresh_ratio", 0.2)
+    sample_mode = samp.get("sample_mode", "skeleton")   # "skeleton" or "grid"
     skel_grid_spacing_m = samp.get("skel_grid_spacing_m", 0.8)
     all_vp = []; debug_imgs = {}; vid = 0
 
@@ -119,8 +120,8 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
         occ[py, px] = 1
 
         kern = np.ones((mk, mk), dtype=np.uint8)
-        closed = binary_dilation(occ, structure=kern, iterations=2).astype(np.uint8)
-        closed = binary_erosion(closed, structure=kern, iterations=2).astype(np.uint8)
+        closed = binary_dilation(occ, structure=kern, iterations=mi).astype(np.uint8)
+        closed = binary_erosion(closed, structure=kern, iterations=mi).astype(np.uint8)
 
         dm = distance_transform_edt(closed)
         dmx = dm.max()

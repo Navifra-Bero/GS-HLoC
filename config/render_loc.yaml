@@ -21,11 +21,25 @@ camera:
   depth_min: 0.3
   depth_max: 15.0
 
+alignment:
+  normal_threshold: 0.6       # 0.8 → noisy normal 허용
+  # 입력 PLY에서 "위(중력 반대)" 방향. 사전 회전으로 +Z에 정렬한 뒤 RANSAC 수행.
+  # 옵션: "x" / "x_neg" / "y" / "y_neg" / "z" / "z_neg"
+  #   z_neg : 기존 LiDAR 맵 (default)
+  #   y_neg : COLMAP 표준 컨벤션
+  up_axis: "y_neg"
+
 sampling:
+  floor_band: 1.5             # 0.3 → 점 더 모으기
+  min_floor_points: 30        # 100 → 작은 floor도 살리기
+  morph_kernel_size: 11       # 5  → kernel 키우기
+  morph_iterations: 4         # 2  → 더 큰 구멍 메우기 (sparse PLY)
+  distance_thresh_ratio: 0.15 # 0.3 → corridor 더 넓게
+  grid_resolution: 0.10       # 0.05 → 픽셀당 10cm로 흐릿하게 (점 모으기)
+  path_spacing: 1.0
   max_floors: 1          # 단일층 강제
   min_floor_gap: 2.5     # 2.5m 이내 peak 병합
   max_floor_height: 5.0  # 5m 이상 무시
-  floor_band: 0.3
   num_yaw_angles: 4
   height_offsets_m: [1.0]   # 기준높이 / 20cm 아래 / 20cm 위 → 4×3=12 views/pos
 
@@ -119,7 +133,7 @@ database:
   ply_map_path: ""
 
 multi_cam:
-  enabled: true              # true = multi-cam retrieval+matching 활성화
+  enabled: false             # true = multi-cam retrieval+matching 활성화
   cam_ids: ["cam_1", "cam_3"] # 사용할 카메라 ID 목록
   primary_cam: "cam_3"        # PnP에 사용할 주 카메라 (intrinsics 기준)
   kapture_dir: "kapture/sensors"  # records_camera.txt 위치
