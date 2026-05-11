@@ -3,6 +3,8 @@ import numpy as np
 import open3d as o3d
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from plyfile import PlyData, PlyElement
+from scipy.spatial.transform import Rotation
 
 
 _AXIS_VECTORS = {
@@ -25,6 +27,58 @@ def _axis_to_z_rotation(up_axis_key):
         return np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
     vx = np.array([[0,-v[2],v[1]],[v[2],0,-v[0]],[-v[1],v[0],0]])
     return np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+
+
+def _quat_wxyz_to_rotmat(q):
+    q = np.asarray(q, dtype=np.float64)
+    q = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return np.stack([
+        1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w),
+        2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+        2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y),
+    ], axis=1).reshape(-1, 3, 3)
+
+
+def _write_transformed_ply_like_input(input_path, output_path, points_aligned, R_total):
+    """Write aligned PLY while preserving Gaussian/SH/opacity/scale properties."""
+    ply = PlyData.read(input_path)
+    vertex = np.array(ply["vertex"].data, copy=True)
+    names = vertex.dtype.names or ()
+
+    for axis, values in zip(("x", "y", "z"), points_aligned.T):
+        if axis in names:
+            vertex[axis] = values.astype(vertex[axis].dtype, copy=False)
+
+    if all(n in names for n in ("nx", "ny", "nz")):
+        normals = np.stack([vertex["nx"], vertex["ny"], vertex["nz"]], axis=1).astype(np.float64)
+        normals = (R_total @ normals.T).T
+        for axis, values in zip(("nx", "ny", "nz"), normals.T):
+            vertex[axis] = values.astype(vertex[axis].dtype, copy=False)
+
+    if all(f"rot_{i}" in names for i in range(4)):
+        quat = np.stack([vertex[f"rot_{i}"] for i in range(4)], axis=1).astype(np.float64)
+        rot = _quat_wxyz_to_rotmat(quat)
+        rot_aligned = np.einsum("ij,njk->nik", R_total, rot)
+        quat_xyzw = Rotation.from_matrix(rot_aligned).as_quat()
+        quat_wxyz = np.column_stack([quat_xyzw[:, 3], quat_xyzw[:, 0], quat_xyzw[:, 1], quat_xyzw[:, 2]])
+        for i in range(4):
+            vertex[f"rot_{i}"] = quat_wxyz[:, i].astype(vertex[f"rot_{i}"].dtype, copy=False)
+
+    elements = [PlyElement.describe(vertex, "vertex")]
+    elements.extend([el for el in ply.elements if el.name != "vertex"])
+    PlyData(
+        elements,
+        text=ply.text,
+        byte_order=ply.byte_order,
+        comments=ply.comments,
+        obj_info=ply.obj_info,
+    ).write(output_path)
+
+    preserved = len(names)
+    gaussian = all(name in names for name in ("opacity", "scale_0", "rot_0"))
+    kind = "Gaussian PLY" if gaussian else "PLY"
+    print(f"  Preserved {kind} properties: {preserved} vertex fields")
 
 
 def step0_align(ply_path, config, output_dir):
@@ -50,18 +104,21 @@ def step0_align(ply_path, config, output_dir):
     has_color = pcd.has_colors()
     print(f"  Loaded: {len(points_orig)} points, color={has_color}")
 
-    # 입력 PLY의 "위(중력 반대)" 방향을 +Z로 가져오는 사전 회전
-    # config: alignment.up_axis ∈ {x, x_neg, y, y_neg, z, z_neg}
-    #   - 기본 LiDAR 컨벤션: "z_neg" (원래 동작과 동일)
-    #   - COLMAP 표준: "y_neg"
-    up_axis = align_cfg.get("up_axis", "z_neg")
-    if up_axis.lower() not in _AXIS_VECTORS:
-        raise ValueError(f"alignment.up_axis must be one of {list(_AXIS_VECTORS.keys())}, got {up_axis!r}")
-    R_flip = _axis_to_z_rotation(up_axis)
-    pcd.points = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.points).T).T)
-    if pcd.has_normals():
-        pcd.normals = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.normals).T).T)
-    print(f"  Pre-rotation: up_axis={up_axis} → +Z")
+    # 입력 PLY의 "위(중력 반대)" 방향을 +Z로 가져오는 사전 회전.
+    # COLMAP/GS 좌표를 그대로 유지하고 싶으면 alignment.apply_pre_rotation=false.
+    apply_pre_rotation = bool(align_cfg.get("apply_pre_rotation", False))
+    if apply_pre_rotation:
+        up_axis = align_cfg.get("up_axis", "z_neg")
+        if up_axis.lower() not in _AXIS_VECTORS:
+            raise ValueError(f"alignment.up_axis must be one of {list(_AXIS_VECTORS.keys())}, got {up_axis!r}")
+        R_flip = _axis_to_z_rotation(up_axis)
+        pcd.points = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.points).T).T)
+        if pcd.has_normals():
+            pcd.normals = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.normals).T).T)
+        print(f"  Pre-rotation: up_axis={up_axis} -> +Z")
+    else:
+        R_flip = np.eye(3)
+        print("  Pre-rotation: disabled")
 
     if not pcd.has_normals():
         print("  Computing normals...")
@@ -111,17 +168,12 @@ def step0_align(ply_path, config, output_dir):
     points_rotated[:, 2] -= floor_z_after
     print(f"  Floor z shifted: {floor_z_after:.4f} → 0")
 
-    pcd_aligned = o3d.geometry.PointCloud()
-    pcd_aligned.points = o3d.utility.Vector3dVector(points_rotated)
-    if has_color:
-        pcd_aligned.colors = pcd.colors
-
     aligned_path = os.path.join(output_dir, "aligned_map.ply")
-    o3d.io.write_point_cloud(aligned_path, pcd_aligned, write_ascii=False, compressed=False)
+    R_total = R @ R_flip
+    _write_transformed_ply_like_input(ply_path, aligned_path, points_rotated, R_total)
     size_gb = os.path.getsize(aligned_path) / 1e9
     print(f"  Saved: {aligned_path} ({size_gb:.2f} GB)")
 
-    R_total = R @ R_flip
     T_align = np.eye(4); T_align[:3,:3] = R_total; T_align[2,3] = -floor_z_after
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))

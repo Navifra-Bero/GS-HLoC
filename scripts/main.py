@@ -34,8 +34,8 @@ from pipeline import (
 def main():
     parser = argparse.ArgumentParser(description="RenderLoc Pipeline")
     parser.add_argument("--ply_map",    required=True)
-    parser.add_argument("--config",     default="config/render_loc.yaml")
-    parser.add_argument("--output_dir", default="output/colmap_sgs_test")
+    parser.add_argument("--config",     default="config/render_loc_multi_cam.yaml")
+    parser.add_argument("--output_dir", default="output/colmap_gsplat_test")
     parser.add_argument("--step",       default="all",
                         choices=["all", "offline", "online", "test"] + STEPS)
     parser.add_argument("--query_image", default=None,
@@ -52,9 +52,18 @@ def main():
 
     # Render mode
     parser.add_argument("--render_mode", default="gs",
-                        choices=["pointcloud", "gs", "2dgs", "sgs", "scaffold_gs"],
-                        help="렌더링 방식: pointcloud (O3D), gs (3DGS), 2dgs (2DGS), sgs (Scaffold-GS), "
+                        choices=["pointcloud", "gaussian_ply", "ns", "nerfstudio",
+                                 "gs", "gs_feature", "fgs", "2dgs", "sgs", "scaffold_gs"],
+                        help="렌더링 방식: pointcloud (O3D), gaussian_ply (aligned Gaussian PLY 직접 렌더), "
+                             "ns/nerfstudio (ns-render 경로로 렌더), "
+                             "gs (3DGS 학습/렌더), gs_feature/fgs (Feature GS 학습/렌더), "
+                             "2dgs (2DGS), sgs (Scaffold-GS), "
                              "scaffold_gs (사전 학습된 Scaffold-GS, --sgs_model_path 필요)")
+    parser.add_argument("--ns_config", default=None,
+                        help="ns/nerfstudio 렌더 모드용 Nerfstudio config.yml 경로")
+    parser.add_argument("--ns_camera_path", default=None,
+                        help="ns/nerfstudio 렌더 모드용 camera path JSON 경로 "
+                             "(기본: output_dir/step1_camera_path.json)")
 
     # scaffold_gs-specific options
     parser.add_argument("--sgs_model_path", default=None,
@@ -73,18 +82,36 @@ def main():
                              "지정 시 --sgs_iteration 무시. 생략 시 자동 결정 (chkpnt_best.json → max iteration).")
 
     # GS-specific options
-    parser.add_argument("--kapture_dir", default="kapture/sensors",
+    parser.add_argument("--kapture_dir", default=None,
                         help="GS 렌더링용 kapture_mapping/sensors 디렉토리")
-    parser.add_argument("--gs_epochs",  type=int, default=150,
-                        help="3DGS 학습 epoch 수 (1 epoch = 전체 이미지 1회)")
+    parser.add_argument("--colmap_dir", default=None,
+                        help="GS 렌더링용 COLMAP SfM 디렉토리 (sparse/0/cameras.txt, images.txt 포함)")
+    parser.add_argument("--gs_iters",  type=int, default=30000,
+                        help="3DGS 학습 iteration 수 (표준 gsplat: 30000)")
+    parser.add_argument("--gs_epochs",  type=int, default=500,
+                        help="2DGS/SGS 학습 epoch 수 (gs 모드에서는 사용 안 함)")
     parser.add_argument("--gs_subsample", type=int, default=1,
                         help="매핑 이미지 서브샘플 간격 (기본 1=전체)")
-    parser.add_argument("--gs_voxel_size", type=float, default=0.03,
+    parser.add_argument("--gs_voxel_size", type=float, default=0.0,
                         help="GS 학습 전 voxel downsample 크기(m). 예: 0.05")
     parser.add_argument("--gs_train_size", type=int, default=1920,
                         help="GS 학습 시 이미지 리사이즈 (긴 쪽 기준, 비율 유지)")
-    parser.add_argument("--gs_accum", type=int, default=8,
-                        help="Gradient accumulation steps (effective batch size)")
+    parser.add_argument("--gs_accum", type=int, default=10,
+                        help="2DGS/SGS gradient accumulation steps (gs 모드에서는 사용 안 함)")
+    parser.add_argument("--gs_save_interval", type=int, default=5000,
+                        help="GS 학습 중 체크포인트·렌더 저장 interval (iteration 단위, 기본 5000)")
+    parser.add_argument("--gs_log_interval", type=int, default=100,
+                        help="wandb 스칼라 로그 기록 주기 (iteration 단위, 기본 100)")
+    parser.add_argument("--fgs_dim", type=int, default=64,
+                        help="gs_feature/fgs 모드의 per-Gaussian feature 차원 (기본 64)")
+    parser.add_argument("--fgs_weight", type=float, default=1.0,
+                        help="gs_feature/fgs 모드 feature loss 가중치 (기본 1.0)")
+    parser.add_argument("--fgs_stride", type=int, default=8,
+                        help="저장할 rendered feature map 해상도 stride (기본 8 → W/8,H/8)")
+    parser.add_argument("--wandb_project", default=None,
+                        help="Weights & Biases 프로젝트명. 지정하면 학습 로그를 wandb에 기록")
+    parser.add_argument("--wandb_run_name", default=None,
+                        help="wandb run 이름 (기본: output_dir 기반 자동 생성)")
     parser.add_argument("--ppisp", action="store_true", default=False,
                         help="PPISP 사용: 카메라간 노출/화이트밸런스 차이 보정 (3DGS 전용)")
 
@@ -124,31 +151,62 @@ def main():
                 save_ply_compare=not args.sgs_no_ply_compare,
                 save_ply_depth=not args.sgs_no_ply_depth,
             )
-        elif args.render_mode in ("gs", "2dgs", "sgs"):
-            if not args.kapture_dir:
-                print("ERROR: --kapture_dir 을 지정하세요.")
+        elif args.render_mode == "gaussian_ply":
+            rendered = step2_render(
+                args.ply_map, vps, config, args.output_dir,
+                step0_data=s0, mode="gaussian_ply",
+            )
+        elif args.render_mode in ("ns", "nerfstudio"):
+            rendered = step2_render(
+                args.ply_map, vps, config, args.output_dir,
+                step0_data=s0, mode="ns",
+                ns_config_path=args.ns_config,
+                ns_camera_path=args.ns_camera_path,
+            )
+        elif args.render_mode in ("gs", "gs_feature", "fgs", "2dgs", "sgs"):
+            if not args.kapture_dir and not args.colmap_dir:
+                print("ERROR: --kapture_dir 또는 --colmap_dir 중 하나를 지정하세요.")
                 return
-            gs_kwargs = dict(
+            common_kwargs = dict(
                 kapture_dir=args.kapture_dir,
-                gs_epochs=args.gs_epochs,
+                colmap_dir=args.colmap_dir,
                 subsample=args.gs_subsample,
                 voxel_size=args.gs_voxel_size,
                 train_img_size=args.gs_train_size,
-                accum_steps=args.gs_accum,
                 use_ppisp=args.ppisp,
             )
             if args.render_mode == "2dgs":
                 rendered = step2_render_2dgs(
                     args.ply_map, vps, config, args.output_dir,
-                    step0_data=s0, **gs_kwargs)
+                    step0_data=s0,
+                    gs_epochs=args.gs_epochs, accum_steps=args.gs_accum,
+                    save_interval=args.gs_save_interval,
+                    wandb_project=args.wandb_project,
+                    wandb_run_name=args.wandb_run_name,
+                    **common_kwargs)
             elif args.render_mode == "sgs":
                 rendered = step2_render_sgs(
                     args.ply_map, vps, config, args.output_dir,
-                    step0_data=s0, **gs_kwargs)
+                    step0_data=s0,
+                    gs_epochs=args.gs_epochs, accum_steps=args.gs_accum,
+                    save_interval=args.gs_save_interval,
+                    wandb_project=args.wandb_project,
+                    wandb_run_name=args.wandb_run_name,
+                    **common_kwargs)
             else:
                 rendered = step2_render(
                     args.ply_map, vps, config, args.output_dir,
-                    step0_data=s0, mode="gs", **gs_kwargs)
+                    step0_data=s0,
+                    mode="gs_feature" if args.render_mode in ("gs_feature", "fgs") else "gs",
+                    gs_iters=args.gs_iters,
+                    save_interval=args.gs_save_interval,
+                    log_interval=args.gs_log_interval,
+                    feature_dim=args.fgs_dim,
+                    feature_weight=args.fgs_weight,
+                    feature_stride=args.fgs_stride,
+                    wandb_project=args.wandb_project,
+                    wandb_run_name=args.wandb_run_name,
+                    **common_kwargs)
         else:
             rendered = step2_render(
                 args.ply_map, vps, config, args.output_dir,

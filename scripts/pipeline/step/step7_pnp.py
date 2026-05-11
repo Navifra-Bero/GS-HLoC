@@ -572,10 +572,10 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
         if estimated_pose is not None:
             trans_thr = float(pnp.get(
                 "multi_cam_consistency_trans_thresh",
-                config.get("multi_cam", {}).get("consistency_trans_thresh", 0.5)))
+                config.get("multi_cam", {}).get("consistency_trans_thresh", 0.1)))
             rot_thr = float(pnp.get(
                 "multi_cam_consistency_rot_thresh_deg",
-                config.get("multi_cam", {}).get("consistency_rot_thresh_deg", 5.0)))
+                config.get("multi_cam", {}).get("consistency_rot_thresh_deg", 1.0)))
             do_joint = bool(pnp.get(
                 "multi_cam_joint_refine",
                 config.get("multi_cam", {}).get("joint_refine", True)))

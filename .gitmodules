@@ -1,3 +1,6 @@
 [submodule "third_party/scaffold_gs"]
 	path = third_party/scaffold_gs
 	url = https://github.com/city-super/Scaffold-GS.git
+[submodule "third_party/gsplat"]
+	path = third_party/gsplat
+	url = https://github.com/nerfstudio-project/gsplat.git

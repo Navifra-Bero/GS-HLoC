@@ -11,37 +11,33 @@ camera:
   cy: 560.82673816
   width: 1920
   height: 1200
-  # fx: 2256.627197
-  # fy: 2254.400635
-  # cx: 1891.352783
-  # cy: 1087.097656
-  # width: 3840
-  # height: 2160
   depth_scale: 1000.0
   depth_min: 0.3
   depth_max: 15.0
 
 alignment:
-  normal_threshold: 0.6       # 0.8 → noisy normal 허용
-  # 입력 PLY에서 "위(중력 반대)" 방향. 사전 회전으로 +Z에 정렬한 뒤 RANSAC 수행.
-  # 옵션: "x" / "x_neg" / "y" / "y_neg" / "z" / "z_neg"
-  #   z_neg : 기존 LiDAR 맵 (default)
-  #   y_neg : COLMAP 표준 컨벤션
+  normal_threshold: 0.6
+  apply_pre_rotation: false
   up_axis: "y_neg"
 
 sampling:
-  floor_band: 1.5             # 0.3 → 점 더 모으기
-  min_floor_points: 30        # 100 → 작은 floor도 살리기
-  morph_kernel_size: 11       # 5  → kernel 키우기
-  morph_iterations: 4         # 2  → 더 큰 구멍 메우기 (sparse PLY)
-  distance_thresh_ratio: 0.15 # 0.3 → corridor 더 넓게
-  grid_resolution: 0.10       # 0.05 → 픽셀당 10cm로 흐릿하게 (점 모으기)
-  path_spacing: 1.0
-  max_floors: 1          # 단일층 강제
-  min_floor_gap: 2.5     # 2.5m 이내 peak 병합
-  max_floor_height: 5.0  # 5m 이상 무시
-  num_yaw_angles: 4
-  height_offsets_m: [1.0]   # 기준높이 / 20cm 아래 / 20cm 위 → 4×3=12 views/pos
+  use_step0_floor: true
+  occupancy_mode: "height_slice_obstacle"
+  height_above_floor: 1.9
+  height_offsets_m: [0.0]
+  slice_min_height_m: 0.5
+  slice_max_height_m: 1.5
+  slice_splat_radius_m: 0.1
+  slice_wall_close_m: 0.5
+  slice_obstacle_inflate_m: 0.2
+  slice_margin_m: 2.0
+  distance_thresh_m: 1.0
+  corridor_blur_sigma: 0.6
+  corridor_blur_threshold: 0.55
+  keep_largest_component: true
+  grid_resolution: 0.20
+  path_spacing: 0.5
+  num_yaw_angles: 6
 
 rendering:
   inpaint_background: true  # 활성화
@@ -52,6 +48,11 @@ rendering:
   point_size: 2.0
   rho_min: 2.0
   render_color: true
+  rasterize_mode: classic       # 또는 antialiased
+  pose_convention: opencv        # nerfstudio export 기본값
+  gs_roll_180: true
+  background_color: [0.0, 0.0, 0.0]
+  gaussian_backend: diff
 
 features:
   superpoint_model: "models/superpoint_v1.pt"

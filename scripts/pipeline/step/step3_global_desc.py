@@ -7,6 +7,46 @@ import matplotlib.pyplot as plt
 from .step2_render import slim_rendered
 
 
+def _resolve_render_path(path, output_dir):
+    """Resolve render paths saved from different working directories."""
+    if not path:
+        return path
+    candidates = [path]
+    if not os.path.isabs(path):
+        candidates.append(os.path.abspath(path))
+        norm = os.path.normpath(path)
+        parts = norm.split(os.sep)
+        if "output" in parts:
+            idx = parts.index("output")
+            candidates.append(os.path.join(os.getcwd(), *parts[idx:]))
+        base = os.path.basename(output_dir.rstrip(os.sep))
+        if base in parts:
+            idx = parts.index(base)
+            candidates.append(os.path.join(output_dir, *parts[idx + 1:]))
+
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            return cand
+    return path
+
+
+def _load_render_rgb(record, output_dir):
+    rgb_path = _resolve_render_path(record.get("rgb_path", ""), output_dir)
+    img = cv2.imread(rgb_path)
+    if img is None:
+        raise FileNotFoundError(f"render RGB not found/readable: {record.get('rgb_path')} -> {rgb_path}")
+    record["rgb_path"] = rgb_path
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def _load_render_depth(record, output_dir):
+    depth_path = _resolve_render_path(record.get("depth_path", ""), output_dir)
+    if not depth_path or not os.path.exists(depth_path):
+        return None
+    record["depth_path"] = depth_path
+    return np.load(depth_path)
+
+
 # =============================================================================
 # Descriptor helpers
 # =============================================================================
@@ -346,12 +386,12 @@ def step3_global_desc(rendered, config, output_dir):
         depth_grid = grid_n if use_spatial else 1
         n_depth_ok = 0
         for i, r in enumerate(rendered):
-            img_rgb  = cv2.cvtColor(cv2.imread(r["rgb_path"]), cv2.COLOR_BGR2RGB)
+            img_rgb  = _load_render_rgb(r, output_dir)
             rgb_desc = (_extract_megaloc_spatial(img_rgb, model, dev, grid_n)
                         if use_spatial else _extract_megaloc_desc(img_rgb, model, dev))
 
-            if use_depth and r.get("depth_path") and os.path.exists(r["depth_path"]):
-                depth_map  = np.load(r["depth_path"])
+            depth_map = _load_render_depth(r, output_dir) if use_depth else None
+            if depth_map is not None:
                 depth_desc = _extract_depth_spatial(depth_map, depth_grid, n_bins)
                 n_depth_ok += 1
             else:
@@ -405,12 +445,12 @@ def step3_global_desc(rendered, config, output_dir):
 
         n_depth_ok = 0
         for i, r in enumerate(rendered):
-            rgb      = cv2.cvtColor(cv2.imread(r["rgb_path"]), cv2.COLOR_BGR2RGB)
+            rgb      = _load_render_rgb(r, output_dir)
             rgb_desc = (_extract_mixvpr_spatial(rgb, model, dev, grid_n)
                         if use_spatial else _extract_mixvpr_desc(rgb, model, dev))
 
-            if use_depth and r.get("depth_path") and os.path.exists(r["depth_path"]):
-                depth_map  = np.load(r["depth_path"])
+            depth_map = _load_render_depth(r, output_dir) if use_depth else None
+            if depth_map is not None:
                 depth_desc = _extract_depth_spatial(depth_map, depth_grid, n_bins)
                 n_depth_ok += 1
             else:
