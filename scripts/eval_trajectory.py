@@ -24,11 +24,11 @@ from scipy.spatial.transform import Rotation
 
 
 # ── Default paths ──────────────────────────────────────────────────────────
-STEP0_PKL      = "output/gs_test/step0_data.pkl"
+STEP0_PKL      = "output/colmap_sgs_test/step0_data.pkl"
 GT_TRAJ_TXT    = "kapture_1_3/sensors/trajectories.txt"
 RIGS_TXT       = "kapture_1_3/sensors/rigs.txt"
-PRED_TUM_TXT   = "output/gs_test/test_results/cam_3/trajectory_tum.txt"
-OUTPUT_DIR     = "output/gs_test/test_results/cam_3"
+PRED_TUM_TXT   = "output/colmap_sgs_test/test_results/cam_3/trajectory_tum.txt"
+OUTPUT_DIR     = "output/colmap_sgs_test/test_results/cam_3"
 CAM_ID         = "cam_3"   # GT를 읽을 카메라 ID
 OUTLIER_THRESH = 5.0   # m — 이 이상의 오차는 outlier로 분류
 

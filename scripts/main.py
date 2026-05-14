@@ -21,7 +21,8 @@ from pipeline import (
     step0_align, step1_viewpoints, step2_render, step2_render_2dgs, step2_render_sgs,
     step2_scaffold_render,
     step3_global_desc, step4_build_db,
-    step5_retrieval, step5_retrieval_type2, step6_match, step6a_match_viz,
+    step5_retrieval, step5_retrieval_type2, step5_retrieval_splathloc,
+    step6_match, step6a_match_viz,
     step6_match_type2,
     step6_match_dedode, step6a_match_viz_dedode,
     step7_pnp,
@@ -86,13 +87,13 @@ def main():
                         help="GS 렌더링용 kapture_mapping/sensors 디렉토리")
     parser.add_argument("--colmap_dir", default=None,
                         help="GS 렌더링용 COLMAP SfM 디렉토리 (sparse/0/cameras.txt, images.txt 포함)")
-    parser.add_argument("--gs_iters",  type=int, default=30000,
+    parser.add_argument("--gs_iters",  type=int, default=50000,
                         help="3DGS 학습 iteration 수 (표준 gsplat: 30000)")
     parser.add_argument("--gs_epochs",  type=int, default=500,
                         help="2DGS/SGS 학습 epoch 수 (gs 모드에서는 사용 안 함)")
     parser.add_argument("--gs_subsample", type=int, default=1,
                         help="매핑 이미지 서브샘플 간격 (기본 1=전체)")
-    parser.add_argument("--gs_voxel_size", type=float, default=0.0,
+    parser.add_argument("--gs_voxel_size", type=float, default=0.07,
                         help="GS 학습 전 voxel downsample 크기(m). 예: 0.05")
     parser.add_argument("--gs_train_size", type=int, default=1920,
                         help="GS 학습 시 이미지 리사이즈 (긴 쪽 기준, 비율 유지)")
@@ -104,7 +105,7 @@ def main():
                         help="wandb 스칼라 로그 기록 주기 (iteration 단위, 기본 100)")
     parser.add_argument("--fgs_dim", type=int, default=64,
                         help="gs_feature/fgs 모드의 per-Gaussian feature 차원 (기본 64)")
-    parser.add_argument("--fgs_weight", type=float, default=1.0,
+    parser.add_argument("--fgs_weight", type=float, default=0.5,
                         help="gs_feature/fgs 모드 feature loss 가중치 (기본 1.0)")
     parser.add_argument("--fgs_stride", type=int, default=8,
                         help="저장할 rendered feature map 해상도 stride (기본 8 → W/8,H/8)")
@@ -292,9 +293,19 @@ def main():
         sisters = find_sister_images(query_path, _mc_records, _mc_cam_ids)
         return sisters if len(sisters) > 1 else None
 
-    # multi_cam.retrieval_type == "type2" → main→sub 종속 리트리벌 사용
+    # retrieval_type 선택:
+    #   "splathloc" → paper Algorithm 1 (adaptive C2F + virtual view fine retrieval)
+    #   "type2"     → multi_cam main→sub 종속 리트리벌
+    #   기본        → step5_retrieval
     _retrieval_type = config.get("multi_cam", {}).get("retrieval_type", "type1")
-    _step5_fn = step5_retrieval_type2 if _retrieval_type == "type2" else step5_retrieval
+    if config.get("splathloc_retrieval", {}).get("enabled", False):
+        _retrieval_type = "splathloc"
+    if _retrieval_type == "splathloc":
+        _step5_fn = step5_retrieval_splathloc
+    elif _retrieval_type == "type2":
+        _step5_fn = step5_retrieval_type2
+    else:
+        _step5_fn = step5_retrieval
 
     s5 = None
     if run_online or args.step == "5_retrieval":

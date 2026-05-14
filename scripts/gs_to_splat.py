@@ -22,8 +22,11 @@ Usage:
 import os, sys, ast, json
 import numpy as np
 import torch
+from torch import nn
+import torch.nn.functional as F
 from argparse import ArgumentParser
 from tqdm import tqdm
+from plyfile import PlyData
 
 # ── scaffold_gs 경로: 모델 backup/ 우선, 없으면 third_party/scaffold_gs ──────
 _DEFAULT_SGS_ROOT = os.path.normpath(
@@ -46,6 +49,223 @@ def _ensure_sgs_path(model_path: str = None) -> str:
 
 
 # ── 모델 로드 (Scene 없이) ─────────────────────────────────────────────────────
+class BakedGaussianModel:
+    """Minimal Scaffold-GS model wrapper for export.
+
+    The training GaussianModel hard-codes CUDA in several places.  For export we
+    only need tensors from point_cloud.ply plus the TorchScript MLPs, so this
+    wrapper keeps the converter usable on CPU-only machines too.
+    """
+
+    def __init__(self, cfg: dict, device: torch.device):
+        def g(k, d): return cfg.get(k, d)
+
+        self.feat_dim = g("feat_dim", 64)
+        self.n_offsets = g("n_offsets", 15)
+        self.use_feat_bank = g("use_feat_bank", False)
+        self.appearance_dim = g("appearance_dim", 0)
+        self.add_opacity_dist = g("add_opacity_dist", False)
+        self.add_cov_dist = g("add_cov_dist", False)
+        self.add_color_dist = g("add_color_dist", True)
+        self.device = device
+
+        self._anchor = None
+        self._offset = None
+        self._anchor_feat = None
+        self._scaling = None
+        self._rotation = None
+        self.mlp_opacity = None
+        self.mlp_cov = None
+        self.mlp_color = None
+        self.mlp_feature_bank = None
+        self.embedding_appearance = None
+
+        self._build_mlp_modules()
+
+    def _build_mlp_modules(self):
+        opacity_dist_dim = 1 if self.add_opacity_dist else 0
+        cov_dist_dim = 1 if self.add_cov_dist else 0
+        color_dist_dim = 1 if self.add_color_dist else 0
+
+        if self.use_feat_bank:
+            self.mlp_feature_bank = nn.Sequential(
+                nn.Linear(4, self.feat_dim),
+                nn.ReLU(True),
+                nn.Linear(self.feat_dim, 3),
+                nn.Softmax(dim=1),
+            ).to(self.device)
+        if self.appearance_dim > 0:
+            # chkpnt_best.pth 로드 시 실제 카메라 개수에 맞춰 다시 만든다.
+            self.embedding_appearance = nn.Embedding(1, self.appearance_dim).to(self.device)
+
+        self.mlp_opacity = nn.Sequential(
+            nn.Linear(self.feat_dim + 3 + opacity_dist_dim, self.feat_dim),
+            nn.ReLU(True),
+            nn.Linear(self.feat_dim, self.n_offsets),
+            nn.Tanh(),
+        ).to(self.device)
+
+        self.mlp_cov = nn.Sequential(
+            nn.Linear(self.feat_dim + 3 + cov_dist_dim, self.feat_dim),
+            nn.ReLU(True),
+            nn.Linear(self.feat_dim, 7 * self.n_offsets),
+        ).to(self.device)
+
+        self.mlp_color = nn.Sequential(
+            nn.Linear(self.feat_dim + 3 + color_dist_dim + self.appearance_dim, self.feat_dim),
+            nn.ReLU(True),
+            nn.Linear(self.feat_dim, 3 * self.n_offsets),
+            nn.Sigmoid(),
+        ).to(self.device)
+
+    def load_pth_checkpoint(self, path: str):
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        if not (isinstance(checkpoint, (tuple, list)) and len(checkpoint) == 2):
+            raise ValueError(f"예상치 못한 checkpoint 형식: {path}")
+
+        model_params, iteration = checkpoint
+        if len(model_params) == 10:
+            (anchor, offset, scaling, rotation, opacity,
+             max_radii2D, offset_denom, _opt_dict, spatial_lr_scale, extras) = model_params
+        else:
+            (anchor, offset, scaling, rotation, opacity,
+             max_radii2D, offset_denom, _opt_dict, spatial_lr_scale) = model_params
+            extras = {}
+
+        def tensor(x):
+            return x.detach().to(self.device) if torch.is_tensor(x) else x
+
+        self._anchor = tensor(anchor)
+        self._offset = tensor(offset)
+        self._scaling = tensor(scaling)
+        self._rotation = tensor(rotation)
+        self._opacity = tensor(opacity)
+        if "_anchor_feat" in extras:
+            self._anchor_feat = tensor(extras["_anchor_feat"])
+
+        if "mlp_opacity" in extras:
+            self.mlp_opacity.load_state_dict(extras["mlp_opacity"])
+        if "mlp_cov" in extras:
+            self.mlp_cov.load_state_dict(extras["mlp_cov"])
+        if "mlp_color" in extras:
+            self.mlp_color.load_state_dict(extras["mlp_color"])
+        if "mlp_feature_bank" in extras and self.use_feat_bank:
+            self.mlp_feature_bank.load_state_dict(extras["mlp_feature_bank"])
+        if "embedding_appearance" in extras and self.appearance_dim > 0:
+            emb_state = extras["embedding_appearance"]
+            weight = emb_state.get("weight") if isinstance(emb_state, dict) else None
+            if weight is not None:
+                self.embedding_appearance = nn.Embedding(
+                    weight.shape[0], weight.shape[1]
+                ).to(self.device)
+                self.embedding_appearance.load_state_dict(emb_state)
+
+        if self._anchor_feat is None:
+            raise ValueError(f"checkpoint 안에 _anchor_feat가 없습니다: {path}")
+        return iteration
+
+    @property
+    def get_anchor(self):
+        return self._anchor
+
+    @property
+    def get_scaling(self):
+        return torch.exp(self._scaling)
+
+    @property
+    def get_opacity_mlp(self):
+        return self.mlp_opacity
+
+    @property
+    def get_cov_mlp(self):
+        return self.mlp_cov
+
+    @property
+    def get_color_mlp(self):
+        return self.mlp_color
+
+    @property
+    def get_featurebank_mlp(self):
+        return self.mlp_feature_bank
+
+    @property
+    def get_appearance(self):
+        return self.embedding_appearance
+
+    @property
+    def get_rotation(self):
+        return self.rotation_activation(self._rotation)
+
+    @staticmethod
+    def rotation_activation(rot):
+        return F.normalize(rot, dim=-1)
+
+    def eval(self):
+        for module in (
+            self.mlp_opacity,
+            self.mlp_cov,
+            self.mlp_color,
+            self.mlp_feature_bank,
+            self.embedding_appearance,
+        ):
+            if module is not None:
+                module.eval()
+
+    def load_ply_sparse_gaussian(self, path: str):
+        plydata = PlyData.read(path)
+        vertex = plydata.elements[0]
+
+        anchor = np.stack((
+            np.asarray(vertex["x"]),
+            np.asarray(vertex["y"]),
+            np.asarray(vertex["z"]),
+        ), axis=1).astype(np.float32)
+
+        scale_names = sorted(
+            [p.name for p in vertex.properties if p.name.startswith("scale_")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        scales = np.stack([np.asarray(vertex[name]) for name in scale_names], axis=1).astype(np.float32)
+
+        rot_names = sorted(
+            [p.name for p in vertex.properties if p.name.startswith("rot")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        rots = np.stack([np.asarray(vertex[name]) for name in rot_names], axis=1).astype(np.float32)
+
+        feat_names = sorted(
+            [p.name for p in vertex.properties if p.name.startswith("f_anchor_feat")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        anchor_feats = np.stack([np.asarray(vertex[name]) for name in feat_names], axis=1).astype(np.float32)
+
+        offset_names = sorted(
+            [p.name for p in vertex.properties if p.name.startswith("f_offset")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        offsets = np.stack([np.asarray(vertex[name]) for name in offset_names], axis=1).astype(np.float32)
+        offsets = offsets.reshape((offsets.shape[0], 3, -1)).transpose(0, 2, 1).copy()
+
+        self._anchor = torch.from_numpy(anchor).to(self.device)
+        self._offset = torch.from_numpy(offsets).to(self.device)
+        self._anchor_feat = torch.from_numpy(anchor_feats).to(self.device)
+        self._scaling = torch.from_numpy(scales).to(self.device)
+        self._rotation = torch.from_numpy(rots).to(self.device)
+
+    def load_mlp_checkpoints(self, path: str):
+        def load_jit(name):
+            module = torch.jit.load(os.path.join(path, name), map_location=self.device)
+            return module.to(self.device)
+
+        self.mlp_opacity = load_jit("opacity_mlp.pt")
+        self.mlp_cov = load_jit("cov_mlp.pt")
+        self.mlp_color = load_jit("color_mlp.pt")
+        if self.use_feat_bank:
+            self.mlp_feature_bank = load_jit("feature_bank_mlp.pt")
+        if self.appearance_dim > 0:
+            self.embedding_appearance = load_jit("embedding_appearance.pt")
+
+
 def _read_cfg_args(model_path: str) -> dict:
     cfg_path = os.path.join(model_path, "cfg_args")
     if not os.path.exists(cfg_path):
@@ -66,29 +286,23 @@ def _read_cfg_args(model_path: str) -> dict:
 
 def load_gaussians(model_path: str, iteration: int):
     _ensure_sgs_path(model_path)
-    from scene.gaussian_model import GaussianModel
     from scene import searchForMaxIteration
+
+    cfg = _read_cfg_args(model_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    gaussians = BakedGaussianModel(cfg, device)
+    print(f"  [device] {device}")
+
+    pth_path = os.path.join(model_path, "chkpnt_best.pth")
+    if os.path.exists(pth_path):
+        loaded_iter = gaussians.load_pth_checkpoint(pth_path)
+        gaussians.eval()
+        print(f"  [load] pth={pth_path}")
+        print(f"  [load] iter={loaded_iter}, anchors: {gaussians.get_anchor.shape[0]:,}")
+        return gaussians, loaded_iter
 
     if iteration == -1:
         iteration = searchForMaxIteration(os.path.join(model_path, "point_cloud"))
-
-    cfg = _read_cfg_args(model_path)
-    def g(k, d): return cfg.get(k, d)
-
-    gaussians = GaussianModel(
-        feat_dim               = g("feat_dim",               64),
-        n_offsets              = g("n_offsets",              15),
-        voxel_size             = g("voxel_size",             0.0),
-        update_depth           = g("update_depth",           3),
-        update_init_factor     = g("update_init_factor",     16),
-        update_hierachy_factor = g("update_hierachy_factor", 4),
-        use_feat_bank          = g("use_feat_bank",          False),
-        appearance_dim         = g("appearance_dim",         0),
-        ratio                  = g("ratio",                  1),
-        add_opacity_dist       = g("add_opacity_dist",       False),
-        add_cov_dist           = g("add_cov_dist",           False),
-        add_color_dist         = g("add_color_dist",         True),
-    )
 
     ckpt_dir = os.path.join(model_path, "point_cloud", f"iteration_{iteration}")
     if not os.path.exists(ckpt_dir):
@@ -101,14 +315,75 @@ def load_gaussians(model_path: str, iteration: int):
     return gaussians, iteration
 
 
-# ── cameras.json → Camera 객체 목록 ───────────────────────────────────────────
-def load_bake_cameras(model_path: str, num_bake_views: int):
-    from scene.cameras import Camera
-    from utils.graphics_utils import focal2fov
+# ── prefilter_voxel용 lightweight Camera ─────────────────────────────────────
+class _LiteCamera:
+    """prefilter_voxel / GaussianRasterizer 가 요구하는 최소 필드만 가진 lightweight camera."""
 
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def _make_full_camera(cam_dict: dict, uid: int, device) -> _LiteCamera:
+    """cameras.json entry → 풀 transform Camera (prefilter_voxel용).
+
+    cameras.json 에는 rotation/position/fx/fy/width/height 가 들어있다.
+    step2_scaffold_render._make_camera 와 같은 변환 규칙을 따른다.
+    """
+    from utils.graphics_utils import focal2fov, getProjectionMatrix, getWorld2View2
+
+    width  = int(cam_dict["width"])
+    height = int(cam_dict["height"])
+    fx     = float(cam_dict["fx"])
+    fy     = float(cam_dict["fy"])
+
+    c2w = np.eye(4, dtype=np.float64)
+    c2w[:3, :3] = np.array(cam_dict["rotation"], dtype=np.float64)
+    c2w[:3,  3] = np.array(cam_dict["position"], dtype=np.float64)
+    w2c   = np.linalg.inv(c2w)
+    R_w2c = w2c[:3, :3]
+    T_w2c = w2c[:3,  3]
+
+    fovx = focal2fov(fx, width)
+    fovy = focal2fov(fy, height)
+    world_view_transform = torch.tensor(
+        getWorld2View2(R_w2c.T, T_w2c, np.array([0.0, 0.0, 0.0]), 1.0)
+    ).transpose(0, 1).to(device)
+    projection_matrix = getProjectionMatrix(
+        znear=0.01, zfar=100.0, fovX=fovx, fovY=fovy
+    ).transpose(0, 1).to(device)
+    full_proj_transform = (
+        world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))
+    ).squeeze(0)
+    camera_center = world_view_transform.inverse()[3, :3]
+
+    return _LiteCamera(
+        uid=uid,
+        colmap_id=uid,
+        image_name=str(cam_dict.get("img_name", f"{uid:05d}")),
+        image_width=width,
+        image_height=height,
+        FoVx=fovx,
+        FoVy=fovy,
+        znear=0.01,
+        zfar=100.0,
+        world_view_transform=world_view_transform,
+        projection_matrix=projection_matrix,
+        full_proj_transform=full_proj_transform,
+        camera_center=camera_center,
+        R=R_w2c.T,
+        T=T_w2c,
+        camera_center_np=np.array(c2w[:3, 3], dtype=np.float32),
+    )
+
+
+# ── cameras.json → Camera 객체 목록 ───────────────────────────────────────────
+def load_bake_cameras(model_path: str, num_bake_views: int, device=None):
     cam_json = os.path.join(model_path, "cameras.json")
     if not os.path.exists(cam_json):
         raise FileNotFoundError(f"cameras.json 없음: {cam_json}")
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     all_cams = json.load(open(cam_json))
     idxs = np.linspace(0, len(all_cams) - 1, min(num_bake_views, len(all_cams)), dtype=int)
@@ -116,50 +391,37 @@ def load_bake_cameras(model_path: str, num_bake_views: int):
     print(f"  [bake] {len(all_cams)} cameras → {len(selected)} 개 선택 (baking)")
 
     cameras = []
+    n_full = n_pos_only = 0
     for uid, cam in enumerate(selected):
-        pos = np.array(cam["position"], dtype=np.float64)   # camera center (C2W col3)
-        R_c2w = np.array(cam["rotation"], dtype=np.float64) # C2W rotation
-        w2c = np.eye(4, dtype=np.float64)
-        w2c[:3, :3] = R_c2w.T
-        w2c[:3,  3] = -(R_c2w.T @ pos)
-        R_w2c = w2c[:3, :3]
-        T_w2c = w2c[:3,  3]
-
-        fx = cam.get("fx", 1039.0)
-        fy = cam.get("fy", 1041.0)
-        w  = cam.get("width",  1920)
-        h  = cam.get("height", 1200)
-        cx = cam.get("cx", w / 2)
-        cy = cam.get("cy", h / 2)
-
-        c = Camera(
-            colmap_id    = uid,
-            R            = R_w2c.T,
-            T            = T_w2c,
-            FoVx         = focal2fov(fx, w),
-            FoVy         = focal2fov(fy, h),
-            image        = torch.zeros((3, h, w), dtype=torch.float32),
-            gt_alpha_mask= None,
-            image_name   = str(uid),
-            uid          = uid,
-            data_device  = "cuda",
-        )
-        cameras.append(c)
-
+        try:
+            cameras.append(_make_full_camera(cam, uid, device))
+            n_full += 1
+        except KeyError as e:
+            print(f"    [warn] cam {uid}: {e} 누락 → position-only fallback (prefilter 불가)")
+            cameras.append(_LiteCamera(
+                uid=uid,
+                camera_center_np=np.array(cam["position"], dtype=np.float32),
+            ))
+            n_pos_only += 1
+    print(f"  [bake] full transforms: {n_full},  position-only: {n_pos_only}")
     return cameras
 
 
 # ── Gaussian baking ───────────────────────────────────────────────────────────
-def bake_gaussians(gaussians, cameras, opacity_threshold: float = 0.005):
-    """MLP 직접 호출로 opacity mask 없이 전체 anchor를 일관 처리.
+def bake_gaussians(
+    gaussians,
+    cameras,
+    opacity_threshold: float = 0.005,
+):
+    """Bake view-adaptive Scaffold-GS outputs into one static .splat map.
 
-    핵심 버그 수정:
-    - generate_neural_gaussians 내부 opacity mask → 카메라마다 Gaussian 수 달라짐
-      → shape 불일치 view 전부 skip → 사실상 1장만 baking
-    - mlp_opacity 출력은 raw logit (sigmoid 미적용) → sigmoid 필요
-    - mlp_color 출력은 이미 Sigmoid() 포함 → clamp(0,1)만 하면 OK
+    Scaffold-GS renders only offsets whose MLP opacity is positive.  The
+    opacity MLP ends with Tanh(), so positive values are already valid alpha
+    values in (0, 1); applying sigmoid here would incorrectly keep negative
+    offsets alive with alpha around 0.5.
     """
     anchor      = gaussians.get_anchor      # [N, 3]
+    device      = anchor.device
     anchor_feat = gaussians._anchor_feat    # [N, C]
     offsets     = gaussians._offset         # [N, k, 3]
     grid_scale  = gaussians.get_scaling     # [N, 6]
@@ -170,14 +432,19 @@ def bake_gaussians(gaussians, cameras, opacity_threshold: float = 0.005):
     gscale_rep   = grid_scale.unsqueeze(1).expand(-1, k, -1).reshape(Nk, 6)
     offsets_flat = offsets.reshape(Nk, 3)
 
-    color_logit_sum = torch.zeros(Nk, 3, device="cuda")  # mlp_color has Sigmoid inside
-    opacity_logit_sum = torch.zeros(Nk, 1, device="cuda")  # mlp_opacity: raw logit
-    xyz_ref = scaling_ref = rot_ref = None
+    color_sum = torch.zeros(Nk, 3, device=device)
+    opacity_sum = torch.zeros(Nk, 1, device=device)
+    scaling_sum = torch.zeros(Nk, 3, device=device)
+    rot_sum = torch.zeros(Nk, 4, device=device)
+    weight_sum = torch.zeros(Nk, 1, device=device)
+    xyz_ref = rot_ref = None
     count = 0
 
     with torch.no_grad():
         for cam in tqdm(cameras, desc="  Baking"):
             try:
+                if not hasattr(cam, "camera_center"):
+                    cam.camera_center = torch.from_numpy(cam.camera_center_np).to(device)
                 ob_view = anchor - cam.camera_center          # [N, 3]
                 ob_dist = ob_view.norm(dim=1, keepdim=True)
                 ob_view = ob_view / (ob_dist + 1e-8)
@@ -186,23 +453,34 @@ def bake_gaussians(gaussians, cameras, opacity_threshold: float = 0.005):
                 cat_wd  = torch.cat([anchor_feat, ob_view, ob_dist], dim=1)
                 cat_nod = torch.cat([anchor_feat, ob_view],           dim=1)
 
-                # color: mlp_color 마지막에 Sigmoid() 있음 → [0,1]
+                # color: mlp_color 마지막에 Sigmoid() 있음 -> [0,1]
                 c_in  = cat_wd if gaussians.add_color_dist else cat_nod
                 color = gaussians.get_color_mlp(c_in).reshape(Nk, 3)
-                color_logit_sum += color.clamp(0, 1)
 
-                # opacity: raw logit → sigmoid 별도 적용 필요
+                # opacity: original renderer uses Tanh output directly.
                 o_in    = cat_wd if gaussians.add_opacity_dist else cat_nod
                 opacity = gaussians.get_opacity_mlp(o_in).reshape(Nk, 1)
-                opacity_logit_sum += opacity  # raw logit 누적
 
-                # geometry: 첫 번째 카메라에서만 계산 (view-independent에 가까움)
+                s_in      = cat_wd if gaussians.add_cov_dist else cat_nod
+                scale_rot = gaussians.get_cov_mlp(s_in).reshape(Nk, 7)
+                scaling   = gscale_rep[:, 3:] * torch.sigmoid(scale_rot[:, :3])
+                rot       = gaussians.rotation_activation(scale_rot[:, 3:7])
+
                 if xyz_ref is None:
-                    s_in      = cat_wd if gaussians.add_cov_dist else cat_nod
-                    scale_rot = gaussians.get_cov_mlp(s_in).reshape(Nk, 7)
-                    xyz_ref     = anchor_rep + offsets_flat * gscale_rep[:, :3]
-                    scaling_ref = gscale_rep[:, 3:] * torch.sigmoid(scale_rot[:, :3])
-                    rot_ref     = gaussians.rotation_activation(scale_rot[:, 3:7])
+                    xyz_ref = anchor_rep + offsets_flat * gscale_rep[:, :3]
+                    rot_ref = rot
+
+                # Quaternion q and -q represent the same rotation.  Align signs
+                # before averaging so rotations do not cancel each other out.
+                sign = torch.where((rot * rot_ref).sum(dim=1, keepdim=True) < 0, -1.0, 1.0)
+                rot = rot * sign
+
+                weight = opacity.clamp(min=0.0)
+                color_sum += color.clamp(0, 1) * weight
+                opacity_sum += weight
+                scaling_sum += scaling * weight
+                rot_sum += rot * weight
+                weight_sum += weight
 
                 count += 1
             except Exception as e:
@@ -211,22 +489,162 @@ def bake_gaussians(gaussians, cameras, opacity_threshold: float = 0.005):
     if count == 0:
         raise RuntimeError("모든 카메라에서 baking 실패")
 
-    color_avg   = (color_logit_sum / count).clamp(0.0, 1.0)
-    # opacity: 평균 logit에 sigmoid 적용 → 올바른 [0,1] 확률값
-    opacity_avg = torch.sigmoid(opacity_logit_sum / count)
+    valid_weight = weight_sum.clamp(min=1e-8)
+    color_avg = (color_sum / valid_weight).clamp(0.0, 1.0)
+    scaling_avg = scaling_sum / valid_weight
+    rot_avg = F.normalize(rot_sum / valid_weight, dim=-1)
+    opacity_avg = (opacity_sum / count).clamp(0.0, 1.0)
 
     mask = (opacity_avg[:, 0] >= opacity_threshold)
     print(f"  [bake] {count} views, "
           f"Gaussians: {Nk:,} → {mask.sum().item():,} (opacity≥{opacity_threshold})")
-    print(f"  scale range: min={scaling_ref[mask].min():.4f}  "
-          f"max={scaling_ref[mask].max():.4f}  "
-          f"mean={scaling_ref[mask].mean():.4f}")
+    print(f"  scale range: min={scaling_avg[mask].min():.4f}  "
+          f"max={scaling_avg[mask].max():.4f}  "
+          f"mean={scaling_avg[mask].mean():.4f}")
 
     return (xyz_ref[mask].cpu().numpy().astype(np.float32),
-            scaling_ref[mask].cpu().numpy().astype(np.float32),
-            rot_ref[mask].cpu().numpy().astype(np.float32),
+            scaling_avg[mask].cpu().numpy().astype(np.float32),
+            rot_avg[mask].cpu().numpy().astype(np.float32),
             color_avg[mask].cpu().numpy(),
             opacity_avg[mask, 0].cpu().numpy())
+
+
+def bake_gaussians_renderer(
+    gaussians,
+    cameras,
+    opacity_threshold: float = 0.005,
+    model_path: str = None,
+):
+    """Bake only Gaussians that pass Scaffold-GS' renderer visibility path.
+
+    This follows step2_scaffold_render.py more closely than the direct MLP bake:
+    prefilter_voxel first culls anchors for the current camera, then
+    generate_neural_gaussians applies the same opacity mask used by render().
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("--bake_mode renderer 는 CUDA 환경이 필요합니다.")
+
+    _ensure_sgs_path(model_path)
+    from gaussian_renderer import generate_neural_gaussians, prefilter_voxel
+
+    device = gaussians.get_anchor.device
+    if device.type != "cuda":
+        raise RuntimeError("renderer bake는 CUDA에 로드된 GaussianModel이 필요합니다.")
+
+    pipe = type("Pipeline", (), {
+        "debug": False,
+        "compute_cov3D_python": False,
+    })()
+    background = torch.zeros(3, dtype=torch.float32, device=device)
+
+    N = gaussians.get_anchor.shape[0]
+    k = gaussians.n_offsets
+    Nk = N * k
+
+    # Keep accumulators on CPU to reduce GPU memory pressure.
+    color_sum = torch.zeros(Nk, 3, dtype=torch.float32)
+    opacity_sum = torch.zeros(Nk, 1, dtype=torch.float32)
+    scaling_sum = torch.zeros(Nk, 3, dtype=torch.float32)
+    rot_sum = torch.zeros(Nk, 4, dtype=torch.float32)
+    weight_sum = torch.zeros(Nk, 1, dtype=torch.float32)
+    seen_count = torch.zeros(Nk, 1, dtype=torch.float32)
+    xyz_ref = torch.empty(Nk, 3, dtype=torch.float32)
+    xyz_seen = torch.zeros(Nk, dtype=torch.bool)
+
+    count = 0
+    used_total = 0
+
+    with torch.no_grad():
+        for cam in tqdm(cameras, desc="  Renderer baking"):
+            if not hasattr(cam, "world_view_transform"):
+                print(f"    skip cam {cam.uid}: full camera transform 없음")
+                continue
+
+            voxel_mask = prefilter_voxel(cam, gaussians, pipe, background)
+            if voxel_mask.sum().item() == 0:
+                count += 1
+                continue
+
+            xyz, color, opacity, scaling, rot, neural_opacity, offset_mask = (
+                generate_neural_gaussians(
+                    cam, gaussians, visible_mask=voxel_mask, is_training=True
+                )
+            )
+            if xyz.shape[0] == 0:
+                count += 1
+                continue
+
+            visible_anchor_idx = torch.nonzero(voxel_mask, as_tuple=False).flatten()
+            full_idx = (
+                visible_anchor_idx[:, None] * k
+                + torch.arange(k, device=device)[None, :]
+            ).reshape(-1)
+            full_idx = full_idx[offset_mask].detach().cpu().long()
+
+            xyz_cpu = xyz.detach().cpu().float()
+            color_cpu = color.detach().cpu().float().clamp(0, 1)
+            opacity_cpu = opacity.detach().cpu().float().clamp(min=0)
+            scaling_cpu = scaling.detach().cpu().float()
+            rot_cpu = rot.detach().cpu().float()
+
+            # Quaternion q and -q are equivalent.  Align against the current
+            # accumulated direction for stable averaging.
+            prev_w = weight_sum[full_idx]
+            has_prev = prev_w[:, 0] > 0
+            if has_prev.any():
+                prev_rot = rot_sum[full_idx[has_prev]] / prev_w[has_prev].clamp(min=1e-8)
+                flip = (rot_cpu[has_prev] * prev_rot).sum(dim=1, keepdim=True) < 0
+                rot_cpu[has_prev] = torch.where(flip, -rot_cpu[has_prev], rot_cpu[has_prev])
+
+            weighted_color = color_cpu * opacity_cpu
+            weighted_scaling = scaling_cpu * opacity_cpu
+            weighted_rot = rot_cpu * opacity_cpu
+
+            color_sum.index_add_(0, full_idx, weighted_color)
+            opacity_sum.index_add_(0, full_idx, opacity_cpu)
+            scaling_sum.index_add_(0, full_idx, weighted_scaling)
+            rot_sum.index_add_(0, full_idx, weighted_rot)
+            weight_sum.index_add_(0, full_idx, opacity_cpu)
+            seen_count.index_add_(0, full_idx, torch.ones_like(opacity_cpu))
+
+            unseen = ~xyz_seen[full_idx]
+            if unseen.any():
+                xyz_ref[full_idx[unseen]] = xyz_cpu[unseen]
+                xyz_seen[full_idx[unseen]] = True
+
+            used_total += int(xyz.shape[0])
+            count += 1
+
+            del voxel_mask, xyz, color, opacity, scaling, rot, neural_opacity, offset_mask
+            torch.cuda.empty_cache()
+
+    if count == 0:
+        raise RuntimeError("renderer bake에 사용할 수 있는 카메라가 없습니다.")
+
+    valid_weight = weight_sum.clamp(min=1e-8)
+    color_avg = (color_sum / valid_weight).clamp(0.0, 1.0)
+    scaling_avg = scaling_sum / valid_weight
+    rot_avg = F.normalize(rot_sum / valid_weight, dim=-1)
+    opacity_avg = (opacity_sum / seen_count.clamp(min=1.0)).clamp(0.0, 1.0)
+
+    mask = xyz_seen & (opacity_avg[:, 0] >= opacity_threshold)
+    if mask.sum().item() == 0:
+        raise RuntimeError(
+            f"renderer bake 결과가 0개입니다. opacity_threshold={opacity_threshold} 를 낮춰보세요."
+        )
+
+    print(f"  [renderer bake] {count} views, generated {used_total:,} view-Gaussians")
+    print(f"  [renderer bake] unique Gaussians: {xyz_seen.sum().item():,} "
+          f"→ {mask.sum().item():,} (opacity≥{opacity_threshold})")
+    print(f"  scale range: min={scaling_avg[mask].min():.4f}  "
+          f"max={scaling_avg[mask].max():.4f}  "
+          f"mean={scaling_avg[mask].mean():.4f}")
+
+    return (xyz_ref[mask].numpy().astype(np.float32),
+            scaling_avg[mask].numpy().astype(np.float32),
+            rot_avg[mask].numpy().astype(np.float32),
+            color_avg[mask].numpy(),
+            opacity_avg[mask, 0].numpy())
 
 
 # ── .splat 저장 ───────────────────────────────────────────────────────────────
@@ -274,6 +692,8 @@ def main():
                         help="색상 baking 에 사용할 카메라 수 (많을수록 안정적)")
     parser.add_argument("--opacity_threshold", type=float, default=0.005,
                         help="이 값 미만 opacity Gaussian 제거 (default: 0.005)")
+    parser.add_argument("--bake_mode", choices=("renderer", "direct"), default="renderer",
+                        help="renderer=step2 렌더러 visibility 경로 사용, direct=MLP 직접 평균")
     parser.add_argument("--output", type=str, default=None,
                         help="저장 경로 (default: <model_path>/point_cloud_120k.splat)")
     args = parser.parse_args()
@@ -287,13 +707,28 @@ def main():
     print(f"  model : {args.model_path}")
     print(f"  iter  : {args.iteration}")
     print(f"  views : {args.num_bake_views}")
+    print(f"  mode  : {args.bake_mode}")
     print(f"  output: {output}\n")
 
     gaussians, loaded_iter = load_gaussians(args.model_path, args.iteration)
-    cameras = load_bake_cameras(args.model_path, args.num_bake_views)
-    xyz, scaling, rot, color, opacity = bake_gaussians(
-        gaussians, cameras, opacity_threshold=args.opacity_threshold
+    cameras = load_bake_cameras(
+        args.model_path,
+        args.num_bake_views,
+        device=gaussians.get_anchor.device,
     )
+    if args.bake_mode == "renderer":
+        xyz, scaling, rot, color, opacity = bake_gaussians_renderer(
+            gaussians,
+            cameras,
+            opacity_threshold=args.opacity_threshold,
+            model_path=args.model_path,
+        )
+    else:
+        xyz, scaling, rot, color, opacity = bake_gaussians(
+            gaussians,
+            cameras,
+            opacity_threshold=args.opacity_threshold,
+        )
     save_splat(xyz, scaling, rot, color, opacity, output)
     print(f"\nDone → {output}")
 
