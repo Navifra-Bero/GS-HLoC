@@ -163,6 +163,8 @@ def _make_gaussian_model(dataset):
         dataset.add_opacity_dist,
         dataset.add_cov_dist,
         dataset.add_color_dist,
+        feat_field_dim=getattr(dataset, "feat_field_dim", 0),
+        feat_gt_dim=getattr(dataset, "feat_gt_dim", 256),
     )
 
 
@@ -728,9 +730,17 @@ def step2_scaffold_render(ply_path: str,
     # ── 출력 폴더 ─────────────────────────────────────────────────────────────
     renders_dir = os.path.join(output_dir, "rendered", "rgb")
     depth_dir   = os.path.join(output_dir, "rendered", "depth")
+    feature_dir = os.path.join(output_dir, "rendered", "feature")
     ply_dir     = os.path.join(output_dir, "rendered", "ply_rgb")
     os.makedirs(renders_dir, exist_ok=True)
     os.makedirs(depth_dir,   exist_ok=True)
+
+    # Feature output enabled iff the loaded model has a feature decoder.
+    has_feat = getattr(gaussians, "feat_decoder", None) is not None and getattr(gaussians, "feat_field_dim", 0) > 0
+    if has_feat:
+        os.makedirs(feature_dir, exist_ok=True)
+        print(f"  [SGS] feature field detected (C'={gaussians.feat_field_dim}, C={gaussians.feat_gt_dim}); "
+              f"saving decoded features to {feature_dir}")
 
     # ── PLY renderer (aligned space) ──────────────────────────────────────────
     o3d_ren = None
@@ -795,7 +805,8 @@ def step2_scaffold_render(ply_path: str,
         with torch.no_grad():
             voxel_mask = prefilter_voxel(cam, gaussians, pipeline, background)
             pkg        = gs_render(cam, gaussians, pipeline, background,
-                                   visible_mask=voxel_mask)
+                                   visible_mask=voxel_mask,
+                                   render_feature=has_feat)
         if depth_supported is None:
             depth_supported = "depth" in pkg
             if not depth_supported:
@@ -825,6 +836,21 @@ def step2_scaffold_render(ply_path: str,
             np.save(dep_path, depth.astype(np.float32))
             depth_source = "gaussian"
 
+        # Feature 저장 (decoder lifts C'→C; saves at H/8 × W/8 like SuperPoint desc)
+        feat_path = ""
+        if has_feat and pkg.get("rendered_feature", None) is not None:
+            with torch.no_grad():
+                F_low = pkg["rendered_feature"].unsqueeze(0)            # (1,C',H,W)
+                F_high = gaussians.feat_decoder(F_low)                  # (1,C,H,W)
+                Hf = max(1, F_high.shape[-2] // 8)
+                Wf = max(1, F_high.shape[-1] // 8)
+                F_high = torch.nn.functional.interpolate(
+                    F_high, size=(Hf, Wf), mode="bilinear", align_corners=False)
+                F_high = torch.nn.functional.normalize(F_high, dim=1)
+                feat_np = F_high[0].cpu().numpy().astype(np.float32)    # (C, H/8, W/8)
+            feat_path = os.path.join(feature_dir, f"{name}.npy")
+            np.save(feat_path, feat_np)
+
         rendered.append({
             "id":           vp["id"],
             "pose":         vp["pose"],     # floor-aligned 좌표 유지
@@ -834,6 +860,7 @@ def step2_scaffold_render(ply_path: str,
             "ply_rgb_path": "",
             "depth_path":   dep_path,
             "depth_source": depth_source,
+            "feature_path": feat_path,
         })
 
         if (idx + 1) % 100 == 0 or (idx + 1) == n:

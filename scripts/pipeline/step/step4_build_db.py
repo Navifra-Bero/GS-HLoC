@@ -14,6 +14,7 @@ def step4_build_db(rendered, output_dir):
     entries = []
 
     depth_descs_list = []
+    feature_info = {"type": None, "stride": None, "shape": None, "n_with_feature": 0}
     for r in rendered:
         gd = r.get("global_descriptor")
         if gd is None:
@@ -21,12 +22,24 @@ def step4_build_db(rendered, output_dir):
             continue
         global_descs.append(gd)
         depth_descs_list.append(r.get("depth_descriptor"))   # None 가능
-        entries.append({
+        entry = {
             "id":         r["id"],
             "pose":       r["pose"],
             "rgb_path":   r["rgb_path"],
             "depth_path": r["depth_path"],
-        })
+        }
+        # ── SplatHLoc coarse matching용 rendered FGS feature 경로 전달 ─────
+        fpath = r.get("feature_path")
+        if fpath:
+            entry["feature_path"]   = fpath
+            entry["feature_shape"]  = r.get("feature_shape")
+            entry["feature_stride"] = r.get("feature_stride")
+            entry["feature_type"]   = r.get("feature_type")
+            feature_info["n_with_feature"] += 1
+            feature_info["type"]   = feature_info["type"]   or r.get("feature_type")
+            feature_info["stride"] = feature_info["stride"] or r.get("feature_stride")
+            feature_info["shape"]  = feature_info["shape"]  or r.get("feature_shape")
+        entries.append(entry)
 
     global_descs = np.array(global_descs, dtype=np.float32)
     norms = np.linalg.norm(global_descs, axis=1, keepdims=True) + 1e-8
@@ -56,11 +69,22 @@ def step4_build_db(rendered, output_dir):
             pca_model    = r.get("pca_model")
             break
 
+    has_feature = feature_info["n_with_feature"] > 0
     db = {"global_descs": global_descs_normed, "kdtree": kdtree,
           "depth_descs": depth_descs_normed, "has_depth": has_depth,
           "entries": entries, "vlad_centers": vlad_centers, "pca_model": pca_model,
-          "global_desc_method": global_desc_method}
+          "global_desc_method": global_desc_method,
+          "has_feature": has_feature,
+          "feature_type":   feature_info["type"],
+          "feature_stride": feature_info["stride"],
+          "feature_shape":  feature_info["shape"]}
     print(f"  Depth descs  : {'stored (' + str(depth_descs_normed.shape) + ')' if has_depth else 'none'}")
+    if has_feature:
+        print(f"  FGS features : {feature_info['n_with_feature']}/{len(entries)} "
+              f"type={feature_info['type']}  stride={feature_info['stride']}  "
+              f"shape={feature_info['shape']}")
+    else:
+        print(f"  FGS features : none (step2 feature_splat 결과 없음)")
     db_pkl = os.path.join(output_dir, "step4_database.pkl")
     db_npz = os.path.join(output_dir, "step4_database.npz")
     pickle.dump(db, open(db_pkl, "wb"))

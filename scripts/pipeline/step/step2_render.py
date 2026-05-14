@@ -1485,6 +1485,8 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
         win_rgb = 0.0
         win_depth = 0.0
         win_depth_count = 0
+        win_psnr = 0.0
+        win_feature = 0.0
         win_count = 0
 
         pbar = tqdm(range(total_iters), desc="  Training", ncols=100)
@@ -1634,16 +1636,27 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
             with torch.no_grad():
                 params["scales"].clamp_(-6.0, 0.0)
 
+            with torch.no_grad():
+                mse = F.mse_loss(pred, gt).item()
+                psnr = -10.0 * math.log10(mse + 1e-10)
+
             # ── window 통계
             win_loss += loss.item()
             win_rgb  += rgb_loss.item()
             if depth_loss.item() > 0:
                 win_depth += depth_loss.item()
                 win_depth_count += 1
+            win_psnr += psnr
+            if feature_splat:
+                win_feature += feature_loss.item()
             win_count += 1
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}",
-                             GS=f"{len(params['means']):,}")
+            postfix = {"loss": f"{loss.item():.4f}",
+                       "psnr": f"{psnr:.2f}",
+                       "GS": f"{len(params['means']):,}"}
+            if feature_splat:
+                postfix["feat"] = f"{feature_loss.item():.4f}"
+            pbar.set_postfix(postfix)
 
             # ── wandb 스칼라 로그 (log_interval iter마다)
             if _wb is not None and (it + 1) % log_interval == 0:
@@ -1652,14 +1665,15 @@ def _render_gs(ply_path, viewpoints, config, output_dir,
                     "loss/total":   win_loss / win_count,
                     "loss/rgb":     win_rgb / win_count,
                     "loss/depth":   win_depth / max(win_depth_count, 1),
+                    "psnr":         win_psnr / win_count,
                     "depth_weight": depth_w,
                     "n_gaussians":  len(params["means"]),
                     "lr/means":     cur_lr,
                 }
                 if feature_splat:
-                    log_payload["loss/feature"] = feature_loss.item()
+                    log_payload["loss/feature"] = win_feature / win_count
                 _wb.log(log_payload, step=it + 1)
-                win_loss = win_rgb = win_depth = 0.0
+                win_loss = win_rgb = win_depth = win_psnr = win_feature = 0.0
                 win_depth_count = win_count = 0
 
             # ── 중간 체크포인트 + 샘플 렌더링 (save_interval iter마다 + 마지막)

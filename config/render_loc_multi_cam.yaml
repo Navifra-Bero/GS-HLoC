@@ -23,30 +23,15 @@ camera:
 alignment:
   normal_threshold: 0.6
   apply_pre_rotation: false
-  up_axis: "y_neg"
+  up_axis: "z_neg"
 
 sampling:
-  use_step0_floor: true
-  occupancy_mode: "height_slice_obstacle"
-  height_above_floor: 1.9
-  height_offsets_m: [0.0]
-  slice_min_height_m: 0.5
-  slice_max_height_m: 1.5
-  slice_splat_radius_m: 0.1
-  slice_wall_close_m: 0.5
-  slice_obstacle_inflate_m: 0.2
-  slice_margin_m: 2.0
-  distance_thresh_m: 1.0
-  corridor_blur_sigma: 0.6
-  corridor_blur_threshold: 0.55
-  keep_largest_component: true
-  grid_resolution: 0.20
-  path_spacing: 0.5
-  num_yaw_angles: 6
   max_floors: 1
   min_floor_gap: 2.5
   max_floor_height: 5.0
   floor_band: 0.3
+  num_yaw_angles: 4
+  height_offsets_m: [0.5]
 
 rendering:
   inpaint_background: true
@@ -59,9 +44,22 @@ rendering:
   render_color: true
   rasterize_mode: classic
   pose_convention: opencv
-  gs_roll_180: true
+  gs_roll_180: false
   background_color: [0.0, 0.0, 0.0]
   gaussian_backend: diff
+
+
+splathloc_retrieval:
+  enabled: true
+  k1: 10                       # paper Table I indoor
+  k2: 100                      # under 150, over 10
+  k3: 5
+  perturb_angle_deg: 5.0       # a
+  perturb_dist_m: 0.5          # b
+  inlier_threshold: 150        # I (indoor); outdoor면 300
+  gv_stride: 10                # paper §A: every 10th retrieved
+  sparse_matcher: "superpoint-lightglue"
+  seed: 0
 
 features:
   superpoint_model: "models/superpoint_v1.pt"
