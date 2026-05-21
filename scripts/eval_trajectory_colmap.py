@@ -30,14 +30,14 @@ from plyfile import PlyData
 from scipy.spatial.transform import Rotation
 
 
-STEP0_PKL = "output/colmap_sgs_test/step0_data.pkl"
+STEP0_PKL = "output/sgs_splat_proxy/step0_data.pkl"
 COLMAP_IMAGES_BIN = "nerfstudio/scene0/sparse/0/images.bin"
 TRANSFORMS_JSON = "nerfstudio/images_metric/transforms.json"
-RIGS_TXT = "kapture/sensors/rigs.txt"
-PRED_JSON = "output/colmap_sgs_test/test_results/cam_3/trajectory_poses.json"
-PRED_TUM = "output/colmap_sgs_test/test_results/cam_3/trajectory_tum.txt"
-OUTPUT_DIR = "output/colmap_sgs_test/test_results/cam_3"
-MAP_PLY = "output/colmap_sgs_test/aligned_map.ply"
+RIGS_TXT = "kapture_data/kapture/sensors/rigs.txt"
+PRED_JSON = "output/sgs_splat_proxy/test_results/cam_3/trajectory_poses.json"
+PRED_TUM = "output/sgs_splat_proxy/test_results/cam_3/trajectory_tum.txt"
+OUTPUT_DIR = "output/sgs_splat_proxy/test_results/cam_3"
+MAP_PLY = "output/sgs_splat_proxy/aligned_map.ply"
 CAM_ID = "cam_3"
 OUTLIER_THRESH = 5.0
 

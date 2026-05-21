@@ -67,6 +67,12 @@ class BakedGaussianModel:
         self.add_opacity_dist = g("add_opacity_dist", False)
         self.add_cov_dist = g("add_cov_dist", False)
         self.add_color_dist = g("add_color_dist", True)
+        # Newer local Scaffold-GS backups may include the SplatHLoc feature
+        # field. Static .splat baking only needs RGB/opacity/covariance, so keep
+        # the feature path disabled while still exposing the attributes expected
+        # by gaussian_renderer.generate_neural_gaussians().
+        self.feat_field_dim = 0
+        self.feat_gt_dim = g("feat_gt_dim", 256)
         self.device = device
 
         self._anchor = None
@@ -78,6 +84,8 @@ class BakedGaussianModel:
         self.mlp_cov = None
         self.mlp_color = None
         self.mlp_feature_bank = None
+        self.mlp_feature = None
+        self.feat_decoder = None
         self.embedding_appearance = None
 
         self._build_mlp_modules()
@@ -151,6 +159,8 @@ class BakedGaussianModel:
             self.mlp_color.load_state_dict(extras["mlp_color"])
         if "mlp_feature_bank" in extras and self.use_feat_bank:
             self.mlp_feature_bank.load_state_dict(extras["mlp_feature_bank"])
+        # Deliberately ignore optional SplatHLoc feature extras. They are useful
+        # for descriptor rendering, but not for RGB .splat export.
         if "embedding_appearance" in extras and self.appearance_dim > 0:
             emb_state = extras["embedding_appearance"]
             weight = emb_state.get("weight") if isinstance(emb_state, dict) else None
@@ -206,6 +216,8 @@ class BakedGaussianModel:
             self.mlp_cov,
             self.mlp_color,
             self.mlp_feature_bank,
+            self.mlp_feature,
+            self.feat_decoder,
             self.embedding_appearance,
         ):
             if module is not None:
@@ -565,11 +577,13 @@ def bake_gaussians_renderer(
                 count += 1
                 continue
 
-            xyz, color, opacity, scaling, rot, neural_opacity, offset_mask = (
-                generate_neural_gaussians(
-                    cam, gaussians, visible_mask=voxel_mask, is_training=True
-                )
+            generated = generate_neural_gaussians(
+                cam, gaussians, visible_mask=voxel_mask, is_training=True
             )
+            if len(generated) == 8:
+                xyz, color, opacity, scaling, rot, neural_opacity, offset_mask, _feat = generated
+            else:
+                xyz, color, opacity, scaling, rot, neural_opacity, offset_mask = generated
             if xyz.shape[0] == 0:
                 count += 1
                 continue
