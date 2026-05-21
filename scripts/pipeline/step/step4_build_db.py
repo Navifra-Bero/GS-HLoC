@@ -4,6 +4,13 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+def _feature_meta_from_path(path):
+    if not path or not os.path.exists(path):
+        return None
+    feat = np.load(path, mmap_mode="r")
+    return tuple(int(x) for x in feat.shape)
+
+
 def step4_build_db(rendered, output_dir):
     """오프라인 마지막 단계: global descriptors를 KDTree로 인덱싱."""
     from scipy.spatial import KDTree
@@ -31,14 +38,18 @@ def step4_build_db(rendered, output_dir):
         # ── SplatHLoc coarse matching용 rendered FGS feature 경로 전달 ─────
         fpath = r.get("feature_path")
         if fpath:
+            if not os.path.isabs(fpath) and not os.path.exists(fpath):
+                candidate = os.path.join(output_dir, fpath)
+                if os.path.exists(candidate):
+                    fpath = candidate
             entry["feature_path"]   = fpath
-            entry["feature_shape"]  = r.get("feature_shape")
+            entry["feature_shape"]  = r.get("feature_shape") or _feature_meta_from_path(fpath)
             entry["feature_stride"] = r.get("feature_stride")
-            entry["feature_type"]   = r.get("feature_type")
+            entry["feature_type"]   = r.get("feature_type") or "rendered_feature"
             feature_info["n_with_feature"] += 1
-            feature_info["type"]   = feature_info["type"]   or r.get("feature_type")
-            feature_info["stride"] = feature_info["stride"] or r.get("feature_stride")
-            feature_info["shape"]  = feature_info["shape"]  or r.get("feature_shape")
+            feature_info["type"]   = feature_info["type"]   or entry["feature_type"]
+            feature_info["stride"] = feature_info["stride"] or entry["feature_stride"]
+            feature_info["shape"]  = feature_info["shape"]  or entry["feature_shape"]
         entries.append(entry)
 
     global_descs = np.array(global_descs, dtype=np.float32)
@@ -88,8 +99,12 @@ def step4_build_db(rendered, output_dir):
     db_pkl = os.path.join(output_dir, "step4_database.pkl")
     db_npz = os.path.join(output_dir, "step4_database.npz")
     pickle.dump(db, open(db_pkl, "wb"))
-    np.savez(db_npz, global_descs=global_descs_normed,
-             poses=np.array([e["pose"] for e in entries]))
+    np.savez(db_npz,
+             global_descs=global_descs_normed,
+             poses=np.array([e["pose"] for e in entries]),
+             feature_paths=np.array([e.get("feature_path", "") for e in entries], dtype=object),
+             feature_shapes=np.array([e.get("feature_shape", None) for e in entries], dtype=object),
+             feature_strides=np.array([e.get("feature_stride", -1) or -1 for e in entries], dtype=np.int32))
 
     print(f"  DB entries : {len(entries)}")
     print(f"  Descriptor : shape={global_descs_normed.shape}")

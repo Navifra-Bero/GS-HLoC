@@ -47,6 +47,33 @@ def _load_render_depth(record, output_dir):
     return np.load(depth_path)
 
 
+def _attach_render_feature_metadata(record, output_dir, rgb_shape=None):
+    """Keep step2 dense feature-map references alive through step3/step4."""
+    feature_path = _resolve_render_path(record.get("feature_path", ""), output_dir)
+    if (not feature_path or not os.path.exists(feature_path)) and record.get("id") is not None:
+        feature_dir = os.path.join(output_dir, "rendered", "feature")
+        rid = int(record["id"])
+        for name in (f"{rid:05d}.npy", f"{rid:06d}.npy"):
+            candidate = os.path.join(feature_dir, name)
+            if os.path.exists(candidate):
+                feature_path = candidate
+                break
+    if not feature_path or not os.path.exists(feature_path):
+        return False
+
+    record["feature_path"] = feature_path
+    if record.get("feature_shape") is None or record.get("feature_stride") is None:
+        feat = np.load(feature_path, mmap_mode="r")
+        record["feature_shape"] = tuple(int(x) for x in feat.shape)
+        if record.get("feature_stride") is None and rgb_shape is not None and len(feat.shape) >= 3:
+            rgb_h = int(rgb_shape[0])
+            feat_h = int(feat.shape[-2])
+            record["feature_stride"] = int(round(rgb_h / max(1, feat_h)))
+    if not record.get("feature_type"):
+        record["feature_type"] = "rendered_feature"
+    return True
+
+
 # =============================================================================
 # Descriptor helpers
 # =============================================================================
@@ -385,8 +412,11 @@ def step3_global_desc(rendered, config, output_dir):
 
         depth_grid = grid_n if use_spatial else 1
         n_depth_ok = 0
+        n_feature_ok = 0
         for i, r in enumerate(rendered):
             img_rgb  = _load_render_rgb(r, output_dir)
+            if _attach_render_feature_metadata(r, output_dir, rgb_shape=img_rgb.shape):
+                n_feature_ok += 1
             rgb_desc = (_extract_megaloc_spatial(img_rgb, model, dev, grid_n)
                         if use_spatial else _extract_megaloc_desc(img_rgb, model, dev))
 
@@ -409,6 +439,7 @@ def step3_global_desc(rendered, config, output_dir):
 
         if use_depth:
             print(f"  Depth used: {n_depth_ok}/{len(rendered)} entries")
+        print(f"  Feature maps kept: {n_feature_ok}/{len(rendered)} entries")
 
         if len(rendered) >= 2:
             _plot_sim_by_yaw(rendered, "global_descriptor", num_yaw,
@@ -444,8 +475,11 @@ def step3_global_desc(rendered, config, output_dir):
         print(f"  RGB desc dim: {rgb_dim}")
 
         n_depth_ok = 0
+        n_feature_ok = 0
         for i, r in enumerate(rendered):
             rgb      = _load_render_rgb(r, output_dir)
+            if _attach_render_feature_metadata(r, output_dir, rgb_shape=rgb.shape):
+                n_feature_ok += 1
             rgb_desc = (_extract_mixvpr_spatial(rgb, model, dev, grid_n)
                         if use_spatial else _extract_mixvpr_desc(rgb, model, dev))
 
@@ -467,6 +501,7 @@ def step3_global_desc(rendered, config, output_dir):
 
         if use_depth:
             print(f"  Depth used: {n_depth_ok}/{len(rendered)} entries")
+        print(f"  Feature maps kept: {n_feature_ok}/{len(rendered)} entries")
 
         if len(rendered) >= 2:
             _plot_sim_by_yaw(rendered, "global_descriptor", num_yaw,
