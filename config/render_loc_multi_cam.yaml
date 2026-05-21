@@ -69,7 +69,7 @@ rendering:
 splathloc_retrieval:
   enabled: true
   k1: 10                       # paper Table I indoor
-  k2: 100                      # under 150, over 10
+  k2: 40                      # under 150, over 10
   k3: 5
   perturb_angle_deg: 10.0       # a
   perturb_dist_m: 1.0          # b
@@ -77,7 +77,7 @@ splathloc_retrieval:
   gv_stride: 10                # paper §A: every 10th retrieved
   sparse_matcher: "superpoint-lightglue"
   fine_trigger: "similarity"    # similarity: 빠름, inlier: 논문식 GV gate
-  similarity_threshold: 0.52    # top retrieval sim이 이보다 낮으면 fine view 생성
+  similarity_threshold: 0.6    # top retrieval sim이 이보다 낮으면 fine view 생성
   verify_virtual_with_gv: false # true면 virtual top-k에만 SuperPoint+LightGlue GV
   fine_renderer: "scaffold_gs" # scaffold_gs | fgs | auto | none
   sgs_model_path: "./scaffold_gs_result/2026-05-14_13:10:32"
