@@ -119,6 +119,16 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config) if os.path.exists(args.config) else default_config()
+    # Scaffold-GS options are useful beyond step2: SplatHLoc step5 fine
+    # retrieval can synthesize virtual views from the same trained checkpoint.
+    if args.sgs_model_path or args.sgs_ckpt or args.sgs_iteration != -1:
+        sh_cfg = config.setdefault("splathloc_retrieval", {})
+        if args.sgs_model_path:
+            sh_cfg["sgs_model_path"] = args.sgs_model_path
+        if args.sgs_ckpt:
+            sh_cfg["sgs_ckpt"] = args.sgs_ckpt
+        if args.sgs_iteration != -1:
+            sh_cfg["sgs_iteration"] = args.sgs_iteration
     os.makedirs(args.output_dir, exist_ok=True)
     run_offline = args.step in ("all", "offline")
     run_online  = args.step in ("all", "online")
