@@ -22,16 +22,33 @@ camera:
 
 alignment:
   normal_threshold: 0.6
-  apply_pre_rotation: false
-  up_axis: "z_neg"
+  apply_pre_rotation: true
+  up_axis: "y_neg"
 
 sampling:
+  occupancy_mode: "height_slice_obstacle"
+  height_above_floor: 1.9
   max_floors: 1
   min_floor_gap: 2.5
   max_floor_height: 5.0
   floor_band: 0.3
+  grid_resolution: 0.05
+  path_spacing: 0.7
   num_yaw_angles: 4
-  height_offsets_m: [0.5]
+  height_offsets_m: [0.0]
+  sample_mode: "grid"
+  skel_grid_spacing_m: 0.7
+  distance_thresh_ratio: 0.35
+  slice_min_height_m: 0.50
+  slice_max_height_m: 2.50
+  slice_floor_splat_radius_m: 0.60
+  slice_floor_close_iterations: 4
+  slice_obstacle_inflate_m: 0.10
+  slice_obstacle_close_m: 0.80
+  slice_wall_close_m: 0.3
+  slice_margin_m: 2.0
+  slice_support_erode_iterations: 0
+  keep_largest_component: true
 
 rendering:
   inpaint_background: true
@@ -54,11 +71,18 @@ splathloc_retrieval:
   k1: 10                       # paper Table I indoor
   k2: 100                      # under 150, over 10
   k3: 5
-  perturb_angle_deg: 5.0       # a
-  perturb_dist_m: 0.5          # b
-  inlier_threshold: 150        # I (indoor); outdoor면 300
+  perturb_angle_deg: 10.0       # a
+  perturb_dist_m: 1.0          # b
+  inlier_threshold: 40        # I (indoor); outdoor면 300
   gv_stride: 10                # paper §A: every 10th retrieved
   sparse_matcher: "superpoint-lightglue"
+  fine_trigger: "similarity"    # similarity: 빠름, inlier: 논문식 GV gate
+  similarity_threshold: 0.52    # top retrieval sim이 이보다 낮으면 fine view 생성
+  verify_virtual_with_gv: false # true면 virtual top-k에만 SuperPoint+LightGlue GV
+  fine_renderer: "scaffold_gs" # scaffold_gs | fgs | auto | none
+  sgs_model_path: "./scaffold_gs_result/2026-05-14_13:10:32"
+  sgs_ckpt: "./scaffold_gs_result/2026-05-14_13:10:32/chkpnt_best.pth"
+  sgs_iteration: -1
   seed: 0
 
 features:
