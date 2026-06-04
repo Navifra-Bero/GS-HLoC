@@ -24,6 +24,7 @@ from .step3_global_desc import (_extract_megaloc_desc, _extract_megaloc_spatial,
                                 _extract_mixvpr_desc, _extract_mixvpr_spatial,
                                 _extract_depth_spatial, _load_query_depth,
                                 _load_mixvpr_model)
+from .multi_cam import infer_cam_id_from_path
 
 
 def _build_position_groups(entries, tol):
@@ -36,11 +37,14 @@ def _build_position_groups(entries, tol):
     groups = {}
     entry_to_key = []
     for i, e in enumerate(entries):
-        pose = np.asarray(e["pose"], dtype=np.float64)
-        x, y, z = pose[:3, 3]
-        key = (round(float(x) / tol) * tol,
-               round(float(y) / tol) * tol,
-               round(float(z) / tol) * tol)
+        if e.get("view_group_id"):
+            key = ("group", str(e["view_group_id"]))
+        else:
+            pose = np.asarray(e["pose"], dtype=np.float64)
+            x, y, z = pose[:3, 3]
+            key = (round(float(x) / tol) * tol,
+                   round(float(y) / tol) * tol,
+                   round(float(z) / tol) * tol)
         groups.setdefault(key, []).append(i)
         entry_to_key.append(key)
     return groups, entry_to_key
@@ -67,7 +71,9 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
         query_images:     {cam_id: path} 멀티캠 딕셔너리. main_cam 키 필수.
     """
     import torch
-    print("\n" + "="*60 + "\nSTEP 5 (type2): Dependent multi-cam retrieval\n" + "="*60)
+    print("\n" + "="*60 +
+          "\nSTEP 5: Type-2 dependent multi-camera retrieval"
+          "\n" + "="*60)
 
     fc    = config["features"]
     mc    = config.get("multi_cam", {})
@@ -214,6 +220,12 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
                 per_rank.append(main_top_results[rank])
                 per_rank_sims.append(main_top_sims[rank])
                 continue
+            cam_filtered = [
+                j for j in siblings
+                if db["entries"][j].get("cam_id") in (None, sub_cam)
+            ]
+            if cam_filtered:
+                siblings = cam_filtered
 
             sib_descs = db["global_descs"][siblings]
             rgb_sub   = sib_descs @ sub_gd
@@ -395,6 +407,32 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
                                        interpolation=cv2.INTER_AREA))
             return np.vstack(imgs) if imgs else query_rgb
 
+        def _make_final_montage(rank):
+            imgs = []
+            target_w = 360
+            for cid in cam_list_ordered:
+                rows = cam_top_results.get(cid, [])
+                if rank >= len(rows):
+                    continue
+                entry, _ = rows[rank]
+                path = entry.get("rgb_path")
+                if not path or not os.path.isfile(path):
+                    continue
+                img = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
+                h, w = img.shape[:2]
+                new_h = max(1, int(h * target_w / max(w, 1)))
+                imgs.append(cv2.resize(img, (target_w, new_h),
+                                       interpolation=cv2.INTER_AREA))
+            return np.vstack(imgs) if imgs else None
+
+        def _final_id_label(rank):
+            labels = []
+            for cid in cam_list_ordered:
+                rows = cam_top_results.get(cid, [])
+                if rank < len(rows):
+                    labels.append(f"{cid}#{rows[rank][0]['id']}")
+            return " / ".join(labels)
+
         final_row = n_cam_rows + 1
         ax = fig.add_subplot(gs[final_row, 0])
         ax.imshow(_make_query_montage())
@@ -410,16 +448,18 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
             sim = combined_sims[rank]
             src_rank = combined_source_ranks[rank]
             shift = _rank_shift_label(src_rank, rank + 1)
-            ref = cv2.cvtColor(cv2.imread(cand["rgb_path"]), cv2.COLOR_BGR2RGB)
+            ref = _make_final_montage(rank)
+            if ref is None:
+                ax.axis("off"); continue
             col = "green" if rank == 0 else "purple"
             ax.imshow(ref)
             ax.set_title(
-                f"F{rank+1} #{cand['id']}  sum={sim:.3f}\n"
+                f"F{rank+1} #{cand['id']}  sum={sim:.3f}  {_final_id_label(rank)}\n"
                 f"src R{src_rank} ({shift})",
                 color=col, fontsize=8, pad=8)
             ax.axis("off")
 
-        fig.suptitle(f"Step 5 [type2]: main={main_cam} → sub={sub_cams} "
+        fig.suptitle(f"Step 5 type2: main={main_cam} → sub={sub_cams} "
                      f"(top-{top_k}, pos_tol={pos_tol}m)", fontsize=12)
         fig.subplots_adjust(left=0.02, right=0.99, top=0.88, bottom=0.04)
         fig.savefig(os.path.join(output_dir, "step5_retrieval.png"),
@@ -434,6 +474,7 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
         "cos_sims":         cos_sims,
         "gt_entry":         gt_entry,
         "query_image_path": query_image_path,
+        "query_cam_id":     infer_cam_id_from_path(query_image_path, [main_cam] + sub_cams) or main_cam,
         "query_images":     query_images,
         "cam_top_results":  cam_top_results,
         "match_top_k":      match_top_k,

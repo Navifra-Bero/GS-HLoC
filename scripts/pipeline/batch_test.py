@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 
 from .step.step5_retrieval import step5_retrieval
 from .step.step5_retrieval_type2 import step5_retrieval_type2
+from .step.step5_retrieval_splathloc import step5_retrieval_splathloc
 from .step.step6_match import step6_match
 from .step.step6_match_type2 import step6_match_type2
 from .step.step7_pnp import step7_pnp
@@ -22,7 +23,10 @@ def localize_single(query_image_path, db, config, work_dir, save_images=True,
     """
     os.makedirs(work_dir, exist_ok=True)
     retrieval_type = config.get("multi_cam", {}).get("retrieval_type", "type1")
-    step5_fn = step5_retrieval_type2 if retrieval_type == "type2" else step5_retrieval
+    if config.get("splathloc_retrieval", {}).get("enabled", False):
+        step5_fn = step5_retrieval_splathloc
+    else:
+        step5_fn = step5_retrieval_type2 if retrieval_type == "type2" else step5_retrieval
     step6_fn = step6_match_type2 if retrieval_type == "type2" else step6_match
     try:
         s5 = step5_fn(query_image_path, db, config, work_dir,
@@ -68,8 +72,10 @@ def run_test_batch(test_dir, db, config, output_dir, gt_poses_path=None,
             mc_kapture_dir = os.path.join(os.getcwd(), mc_kapture_dir)
         if os.path.exists(mc_kapture_dir):
             mc_records = parse_kapture_records(mc_kapture_dir)
+            mc_record_count = sum(
+                1 for k in mc_records.keys() if not str(k).startswith("__"))
             print(f"  Multi-cam enabled: cams={mc_cam_ids}  primary={mc_primary}  "
-                  f"records={len(mc_records)} timestamps")
+                  f"records={mc_record_count} timestamps")
         else:
             print(f"  WARNING: multi_cam.enabled=true but kapture_dir not found: {mc_kapture_dir}")
 

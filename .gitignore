@@ -32,3 +32,25 @@ venv/
 .idea/
 *.swp
 .DS_Store
+
+
+# --- 모델 가중치 파일 ---
+*.pth
+chkpnt_best.pth
+
+# --- 데이터셋 및 결과물 폴더 ---
+data/
+kapture_data/
+kapture_1_3/
+gsplat_result/
+scaffold_gs_result/
+
+# --- 로그 및 캐시 폴더 ---
+wandb/
+
+# --- IDE 설정 ---
+.codex
+
+# --- 외부 라이브러리 폴더 (직접 추적하지 않을 경우) ---
+nerfstudio/
+third_party/

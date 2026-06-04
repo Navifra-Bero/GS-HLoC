@@ -3,6 +3,8 @@ import numpy as np
 import open3d as o3d
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from plyfile import PlyData, PlyElement
+from scipy.spatial.transform import Rotation
 
 
 _AXIS_VECTORS = {
@@ -25,6 +27,112 @@ def _axis_to_z_rotation(up_axis_key):
         return np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
     vx = np.array([[0,-v[2],v[1]],[v[2],0,-v[0]],[-v[1],v[0],0]])
     return np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+
+
+def _z_yaw_rotation(deg):
+    rad = np.deg2rad(float(deg))
+    c, s = np.cos(rad), np.sin(rad)
+    return np.array([[c, -s, 0.0],
+                     [s,  c, 0.0],
+                     [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def _quat_wxyz_to_rotmat(q):
+    q = np.asarray(q, dtype=np.float64)
+    q = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return np.stack([
+        1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w),
+        2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+        2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y),
+    ], axis=1).reshape(-1, 3, 3)
+
+
+def _write_transformed_ply_like_input(input_path, output_path, points_aligned, R_total,
+                                      keep_mask=None):
+    """Write aligned PLY while preserving Gaussian/SH/opacity/scale properties.
+
+    keep_mask: optional boolean array over the *original* vertices. When given,
+    only the masked-in vertices are written. ``points_aligned`` must already be
+    the aligned coordinates of those kept vertices (same length as keep_mask.sum()).
+    """
+    ply = PlyData.read(input_path)
+    vertex = np.array(ply["vertex"].data, copy=True)
+    if keep_mask is not None:
+        vertex = vertex[keep_mask]
+    names = vertex.dtype.names or ()
+
+    for axis, values in zip(("x", "y", "z"), points_aligned.T):
+        if axis in names:
+            vertex[axis] = values.astype(vertex[axis].dtype, copy=False)
+
+    if all(n in names for n in ("nx", "ny", "nz")):
+        normals = np.stack([vertex["nx"], vertex["ny"], vertex["nz"]], axis=1).astype(np.float64)
+        normals = (R_total @ normals.T).T
+        for axis, values in zip(("nx", "ny", "nz"), normals.T):
+            vertex[axis] = values.astype(vertex[axis].dtype, copy=False)
+
+    if all(f"rot_{i}" in names for i in range(4)):
+        quat = np.stack([vertex[f"rot_{i}"] for i in range(4)], axis=1).astype(np.float64)
+        rot = _quat_wxyz_to_rotmat(quat)
+        rot_aligned = np.einsum("ij,njk->nik", R_total, rot)
+        quat_xyzw = Rotation.from_matrix(rot_aligned).as_quat()
+        quat_wxyz = np.column_stack([quat_xyzw[:, 3], quat_xyzw[:, 0], quat_xyzw[:, 1], quat_xyzw[:, 2]])
+        for i in range(4):
+            vertex[f"rot_{i}"] = quat_wxyz[:, i].astype(vertex[f"rot_{i}"].dtype, copy=False)
+
+    elements = [PlyElement.describe(vertex, "vertex")]
+    elements.extend([el for el in ply.elements if el.name != "vertex"])
+    PlyData(
+        elements,
+        text=ply.text,
+        byte_order=ply.byte_order,
+        comments=ply.comments,
+        obj_info=ply.obj_info,
+    ).write(output_path)
+
+    preserved = len(names)
+    gaussian = all(name in names for name in ("opacity", "scale_0", "rot_0"))
+    kind = "Gaussian PLY" if gaussian else "PLY"
+    print(f"  Preserved {kind} properties: {preserved} vertex fields")
+
+
+def _compute_crop_mask(points, crop_cfg):
+    """정렬된(Z-up) 좌표에서 불필요한 외곽 포인트를 제거하는 boolean keep-mask.
+
+    지원 옵션 (alignment.crop):
+      xy_radius : 이 XY 반경(중심 기준)을 넘는 포인트 제거 (top-down 원형 노이즈)
+      center    : [cx, cy] XY 중심. null/미지정이면 origin(0,0) 사용
+      z_min/z_max : 이 Z 범위를 벗어나는 포인트 제거
+      bbox      : [xmin, xmax, ymin, ymax] XY 박스 밖 포인트 제거
+    """
+    keep = np.ones(len(points), dtype=bool)
+
+    xy_radius = crop_cfg.get("xy_radius", None)
+    if xy_radius is not None:
+        center = crop_cfg.get("center", None) or [0.0, 0.0]
+        cx, cy = float(center[0]), float(center[1])
+        r = np.sqrt((points[:, 0] - cx) ** 2 + (points[:, 1] - cy) ** 2)
+        keep &= r <= float(xy_radius)
+        print(f"  Crop: xy_radius={xy_radius} center=({cx:.1f},{cy:.1f})")
+
+    bbox = crop_cfg.get("bbox", None)
+    if bbox is not None:
+        xmin, xmax, ymin, ymax = [float(v) for v in bbox]
+        keep &= (points[:, 0] >= xmin) & (points[:, 0] <= xmax)
+        keep &= (points[:, 1] >= ymin) & (points[:, 1] <= ymax)
+        print(f"  Crop: bbox x[{xmin},{xmax}] y[{ymin},{ymax}]")
+
+    z_min = crop_cfg.get("z_min", None)
+    if z_min is not None:
+        keep &= points[:, 2] >= float(z_min)
+    z_max = crop_cfg.get("z_max", None)
+    if z_max is not None:
+        keep &= points[:, 2] <= float(z_max)
+    if z_min is not None or z_max is not None:
+        print(f"  Crop: z[{z_min},{z_max}]")
+
+    return keep
 
 
 def step0_align(ply_path, config, output_dir):
@@ -50,18 +158,21 @@ def step0_align(ply_path, config, output_dir):
     has_color = pcd.has_colors()
     print(f"  Loaded: {len(points_orig)} points, color={has_color}")
 
-    # 입력 PLY의 "위(중력 반대)" 방향을 +Z로 가져오는 사전 회전
-    # config: alignment.up_axis ∈ {x, x_neg, y, y_neg, z, z_neg}
-    #   - 기본 LiDAR 컨벤션: "z_neg" (원래 동작과 동일)
-    #   - COLMAP 표준: "y_neg"
-    up_axis = align_cfg.get("up_axis", "z_neg")
-    if up_axis.lower() not in _AXIS_VECTORS:
-        raise ValueError(f"alignment.up_axis must be one of {list(_AXIS_VECTORS.keys())}, got {up_axis!r}")
-    R_flip = _axis_to_z_rotation(up_axis)
-    pcd.points = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.points).T).T)
-    if pcd.has_normals():
-        pcd.normals = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.normals).T).T)
-    print(f"  Pre-rotation: up_axis={up_axis} → +Z")
+    # 입력 PLY의 "위(중력 반대)" 방향을 +Z로 가져오는 사전 회전.
+    # COLMAP/GS 좌표를 그대로 유지하고 싶으면 alignment.apply_pre_rotation=false.
+    apply_pre_rotation = bool(align_cfg.get("apply_pre_rotation", False))
+    if apply_pre_rotation:
+        up_axis = align_cfg.get("up_axis", "z_neg")
+        if up_axis.lower() not in _AXIS_VECTORS:
+            raise ValueError(f"alignment.up_axis must be one of {list(_AXIS_VECTORS.keys())}, got {up_axis!r}")
+        R_flip = _axis_to_z_rotation(up_axis)
+        pcd.points = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.points).T).T)
+        if pcd.has_normals():
+            pcd.normals = o3d.utility.Vector3dVector((R_flip @ np.asarray(pcd.normals).T).T)
+        print(f"  Pre-rotation: up_axis={up_axis} -> +Z")
+    else:
+        R_flip = np.eye(3)
+        print("  Pre-rotation: disabled")
 
     if not pcd.has_normals():
         print("  Computing normals...")
@@ -77,11 +188,41 @@ def step0_align(ply_path, config, output_dir):
     z_low  = np.percentile(z_vals, 40)
     floor_mask = z_vals <= z_low
     pcd_floor = pcd.select_by_index(np.where(floor_mask)[0])
-    print(f"  RANSAC on bottom-40% points ({floor_mask.sum()}) (dist={rd}, iter={ri})...")
-    plane_model, inliers_sub = pcd_floor.segment_plane(
-        distance_threshold=rd, ransac_n=rn, num_iterations=ri)
+    normal_thr = float(align_cfg.get("normal_threshold", 0.6))
+    max_trials = int(align_cfg.get("max_plane_trials", 8))
+    print(f"  RANSAC on bottom-40% points ({floor_mask.sum()}) "
+          f"(dist={rd}, iter={ri}, normal_thr={normal_thr})...")
     orig_indices = np.where(floor_mask)[0]
-    inliers = orig_indices[inliers_sub]
+
+    work = pcd_floor
+    work_indices = orig_indices.copy()
+    plane_model = None
+    inliers = np.array([], dtype=int)
+    for trial in range(max_trials):
+        if len(work_indices) < rn:
+            break
+        cand_model, cand_inliers_sub = work.segment_plane(
+            distance_threshold=rd, ransac_n=rn, num_iterations=ri)
+        cand_normal = np.asarray(cand_model[:3], dtype=np.float64)
+        cand_normal /= np.linalg.norm(cand_normal)
+        z_score = abs(float(cand_normal[2]))
+        cand_inliers = work_indices[cand_inliers_sub]
+        print(f"    plane#{trial+1}: normal={cand_normal.round(4)}  "
+              f"|nz|={z_score:.3f}  inliers={len(cand_inliers)}")
+        if z_score >= normal_thr:
+            plane_model = cand_model
+            inliers = cand_inliers
+            break
+        keep_mask = np.ones(len(work_indices), dtype=bool)
+        keep_mask[cand_inliers_sub] = False
+        work_indices = work_indices[keep_mask]
+        work = pcd.select_by_index(work_indices)
+
+    if plane_model is None:
+        raise RuntimeError(
+            "Failed to find a floor-like plane. Try lowering alignment.normal_threshold "
+            "or check alignment.up_axis.")
+
     a, b, c, d = plane_model
     floor_normal = np.array([a, b, c])
     floor_normal /= np.linalg.norm(floor_normal)
@@ -105,23 +246,36 @@ def step0_align(ply_path, config, output_dir):
     angle_deg = np.degrees(np.arccos(np.clip(c_val, -1, 1)))
     print(f"  Rotation: {angle_deg:.2f}°")
 
+    yaw_deg = float(align_cfg.get("yaw_deg", 0.0))
+    R_yaw = _z_yaw_rotation(yaw_deg)
+    if abs(yaw_deg) > 1e-9:
+        print(f"  Post-level yaw: {yaw_deg:.2f}° around +Z")
+
     points = np.asarray(pcd.points)
     points_rotated = (R @ points.T).T
+    points_rotated = (R_yaw @ points_rotated.T).T
     floor_z_after = np.median(points_rotated[inliers, 2])
     points_rotated[:, 2] -= floor_z_after
     print(f"  Floor z shifted: {floor_z_after:.4f} → 0")
 
-    pcd_aligned = o3d.geometry.PointCloud()
-    pcd_aligned.points = o3d.utility.Vector3dVector(points_rotated)
-    if has_color:
-        pcd_aligned.colors = pcd.colors
+    # 정렬된 프레임에서 외곽 노이즈(주차장 외벽 원형 포인트 등) 제거
+    crop_cfg = align_cfg.get("crop", {}) or {}
+    if crop_cfg.get("enable", False):
+        keep_mask = _compute_crop_mask(points_rotated, crop_cfg)
+        removed = int((~keep_mask).sum())
+        print(f"  Crop: removed {removed}/{len(keep_mask)} points "
+              f"({100.0*removed/max(len(keep_mask),1):.1f}%), kept {int(keep_mask.sum())}")
+        points_rotated = points_rotated[keep_mask]
+    else:
+        keep_mask = None
 
     aligned_path = os.path.join(output_dir, "aligned_map.ply")
-    o3d.io.write_point_cloud(aligned_path, pcd_aligned, write_ascii=False, compressed=False)
+    R_total = R_yaw @ R @ R_flip
+    _write_transformed_ply_like_input(ply_path, aligned_path, points_rotated, R_total,
+                                      keep_mask=keep_mask)
     size_gb = os.path.getsize(aligned_path) / 1e9
     print(f"  Saved: {aligned_path} ({size_gb:.2f} GB)")
 
-    R_total = R @ R_flip
     T_align = np.eye(4); T_align[:3,:3] = R_total; T_align[2,3] = -floor_z_after
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
@@ -158,6 +312,9 @@ def step0_align(ply_path, config, output_dir):
     data = {
         "aligned_ply_path": aligned_path, "T_align": T_align, "R": R,
         "floor_normal_orig": floor_normal, "floor_z_shift": floor_z_after, "inliers": inliers,
+        "source_ply_path": os.path.abspath(ply_path),
+        "source_vertex_count": int(len(points_orig)),
+        "aligned_vertex_count": int(len(points_rotated)),
     }
     pickle.dump(data, open(os.path.join(output_dir, "step0_data.pkl"), "wb"))
     return data

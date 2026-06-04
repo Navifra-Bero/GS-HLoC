@@ -9,6 +9,7 @@ from .step.step3_global_desc import step3_global_desc
 from .step.step4_build_db import step4_build_db
 from .step.step5_retrieval import step5_retrieval
 from .step.step5_retrieval_type2 import step5_retrieval_type2
+from .step.step5_retrieval_splathloc import step5_retrieval_splathloc
 from .step.step6_match import step6_match, step6a_match_viz
 from .step.step6_match_type2 import step6_match_type2
 from .step.step6_match_dedode import step6_match_dedode, step6a_match_viz_dedode

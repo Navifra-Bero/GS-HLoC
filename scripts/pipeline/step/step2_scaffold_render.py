@@ -5,10 +5,13 @@ STEP 2: Rendering — Pre-trained Scaffold-GS model
 train.py 의 render_set 과 동일한 방식(prefilter_voxel → render)을 사용합니다.
 
 좌표계:
-  step0_align 이 출력하는 T_align 은 GS 모델 좌표 → floor-aligned 좌표 변환:
-    p_aligned  = T_align @ p_model
+  step0_align 이 출력하는 T_align 은 map 좌표 → floor-aligned 좌표 변환.
+  외부에서 만든 PLY를 쓰는 경우, 학습 checkpoint 좌표와 PLY 좌표가 다를 수 있다.
+  이때 alignment.model_to_map_transform_json 로 checkpoint/model 좌표 → map 좌표
+  변환을 명시할 수 있다:
+    p_aligned  = T_align @ model_to_map @ p_model
   렌더링에는 모델 좌표가 필요하므로 역변환:
-    c2w_model  = inv(T_align) @ c2w_aligned
+    c2w_model  = inv(T_align @ model_to_map) @ c2w_aligned
 
 use_train_cameras=True 모드:
   Scene.getTrainCameras() 로 실제 학습 카메라를 그대로 사용합니다.
@@ -26,7 +29,7 @@ Usage (main.py):
   # train.py / render.py 방식 (실제 학습 카메라 사용):
   python3 scripts/main.py ... --sgs_use_train_cameras
 """
-import os, sys, ast, pickle, time
+import os, sys, ast, pickle, time, json, types, inspect
 import numpy as np
 import torch
 import torchvision
@@ -90,6 +93,7 @@ def _ensure_sgs_path(model_path: str = None) -> str:
     if _ACTIVE_SGS_ROOT == root:
         if root not in sys.path:
             sys.path.insert(0, root)
+        _clear_conflicting_sgs_modules(root)
         return root
 
     roots_to_clear = {os.path.normpath(os.path.abspath(_DEFAULT_SGS_ROOT))}
@@ -107,10 +111,37 @@ def _ensure_sgs_path(model_path: str = None) -> str:
     sys.path.insert(0, root)
     _ACTIVE_SGS_ROOT = root
 
+    _clear_conflicting_sgs_modules(root)
+
     print(f"  [SGS] 코드 경로: {root}")
     if model_path and not used_backup:
         print("  [SGS] model backup code 없음 → third_party/scaffold_gs fallback 사용")
     return root
+
+
+def _clear_conflicting_sgs_modules(root: str) -> None:
+    # Scaffold-GS uses generic top-level package names such as `utils`.
+    # Step5 may already have loaded MixVPR's `utils`, so force these names to
+    # resolve from the active Scaffold-GS root on the next import.
+    scaffold_prefixes = ("gaussian_renderer", "scene", "arguments", "utils")
+    for name, module in list(sys.modules.items()):
+        if not any(name == p or name.startswith(p + ".") for p in scaffold_prefixes):
+            continue
+        if not _module_under_root(module, root):
+            sys.modules.pop(name, None)
+
+    # The backup/utils directory commonly has no __init__.py. If another
+    # dependency provides a regular top-level `utils` package (MixVPR does),
+    # Python will prefer that regular package over Scaffold-GS' namespace
+    # directory even when the Scaffold root is earlier in sys.path. Bind it
+    # explicitly so `from utils.system_utils import ...` lands in backup/utils.
+    utils_dir = os.path.join(root, "utils")
+    if os.path.isdir(utils_dir) and "utils" not in sys.modules:
+        mod = types.ModuleType("utils")
+        mod.__path__ = [utils_dir]
+        mod.__package__ = "utils"
+        mod.__file__ = os.path.join(utils_dir, "__init__.py")
+        sys.modules["utils"] = mod
 
 
 def _read_cfg_args(model_path: str) -> dict:
@@ -131,6 +162,57 @@ def _read_cfg_args(model_path: str) -> dict:
         except Exception:
             params[k.strip()] = v.strip()
     return params
+
+
+def _as_4x4_transform(arr, name: str) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.shape == (4, 4):
+        return arr
+    if arr.shape == (3, 4):
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :4] = arr
+        return T
+    raise ValueError(f"{name} shape must be 3x4 or 4x4, got {arr.shape}")
+
+
+def _load_model_to_map_transform(config: dict, output_dir: str) -> np.ndarray:
+    """Optional Scaffold/checkpoint model -> PLY map-frame transform."""
+    align_cfg = config.get("alignment", {})
+    if bool(align_cfg.get("disable_model_to_map_transform", False)):
+        return np.eye(4, dtype=np.float64)
+
+    candidates = []
+    configured = align_cfg.get("model_to_map_transform_json")
+    if configured:
+        candidates.append(configured)
+    else:
+        # Keep auto-detection local to this run directory only. Do not reach into
+        # nerfstudio/ implicitly when rendering a Scaffold-GS checkpoint.
+        candidates.append(os.path.join(output_dir, "model_to_map_transform.json"))
+
+    seen = set()
+    for path in candidates:
+        if not path:
+            continue
+        path = os.path.abspath(os.path.expanduser(path))
+        if path in seen:
+            continue
+        seen.add(path)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("model_to_map_transform", data.get("transform"))
+        if raw is None:
+            continue
+        T = _as_4x4_transform(raw, "model_to_map_transform")
+        print(f"  [SGS] model_to_map_transform 사용: {path}")
+        print(f"  [SGS] model_to_map_transform:\n{T[:3, :4]}")
+        return T
+
+    if configured:
+        print(f"  [SGS] model_to_map_transform_json 없음/미사용: {configured}")
+    return np.eye(4, dtype=np.float64)
 
 
 def _build_dataset_args(model_path: str) -> Namespace:
@@ -163,6 +245,8 @@ def _make_gaussian_model(dataset):
         dataset.add_opacity_dist,
         dataset.add_cov_dist,
         dataset.add_color_dist,
+        feat_field_dim=getattr(dataset, "feat_field_dim", 0),
+        feat_gt_dim=getattr(dataset, "feat_gt_dim", 256),
     )
 
 
@@ -674,12 +758,18 @@ def step2_scaffold_render(ply_path: str,
     _ensure_sgs_path(sgs_model_path)
     from gaussian_renderer import render as gs_render, prefilter_voxel
 
-    # ── T_align ────────────────────────────────────────────────────────────────
+    # ── model -> aligned transform ────────────────────────────────────────────
     if step0_data is not None and "T_align" in step0_data:
         T_align = np.array(step0_data["T_align"], dtype=np.float64)
     else:
         T_align = np.eye(4, dtype=np.float64)
-    T_inv = np.linalg.inv(T_align)
+    T_model_to_map = _load_model_to_map_transform(config, output_dir)
+    T_model_to_aligned = T_align @ T_model_to_map
+    T_aligned_to_model = np.linalg.inv(T_model_to_aligned)
+    if np.linalg.norm(T_model_to_map - np.eye(4)) > 1e-9:
+        print("  [SGS] pose transform: c2w_model = inv(T_align @ model_to_map) @ c2w_aligned")
+    else:
+        print("  [SGS] pose transform: c2w_model = inv(T_align) @ c2w_aligned")
 
     # ── 모델/Scene 로드 (render.py render_sets 와 동일한 경로) ──────────────────
     ctx = _load_render_context(sgs_model_path, sgs_iteration, pth_path=sgs_ckpt_path)
@@ -703,13 +793,13 @@ def step2_scaffold_render(ply_path: str,
     if use_train_cameras:
         if train_cameras is not None:
             print(f"  [SGS] train.py 방식: Scene.getTrainCameras() 사용 ({len(train_cameras)} cams)")
-            viewpoints = _scene_cameras_as_viewpoints(train_cameras, T_align)
+            viewpoints = _scene_cameras_as_viewpoints(train_cameras, T_model_to_aligned)
         else:
             train_only_records = _filter_camera_records(train_camera_records, split="train")
             if not train_only_records:
                 train_only_records = train_camera_records
             print(f"  [SGS] train.py fallback: cameras.json train pose 사용 ({len(train_only_records)} cams)")
-            viewpoints = _camera_records_as_viewpoints(train_only_records, T_align)
+            viewpoints = _camera_records_as_viewpoints(train_only_records, T_model_to_aligned)
     else:
         if not viewpoints:
             raise ValueError("viewpoints 가 비어 있습니다. "
@@ -728,9 +818,17 @@ def step2_scaffold_render(ply_path: str,
     # ── 출력 폴더 ─────────────────────────────────────────────────────────────
     renders_dir = os.path.join(output_dir, "rendered", "rgb")
     depth_dir   = os.path.join(output_dir, "rendered", "depth")
+    feature_dir = os.path.join(output_dir, "rendered", "feature")
     ply_dir     = os.path.join(output_dir, "rendered", "ply_rgb")
     os.makedirs(renders_dir, exist_ok=True)
     os.makedirs(depth_dir,   exist_ok=True)
+
+    # Feature output enabled iff the loaded model has a feature decoder.
+    has_feat = getattr(gaussians, "feat_decoder", None) is not None and getattr(gaussians, "feat_field_dim", 0) > 0
+    if has_feat:
+        os.makedirs(feature_dir, exist_ok=True)
+        print(f"  [SGS] feature field detected (C'={gaussians.feat_field_dim}, C={gaussians.feat_gt_dim}); "
+              f"saving decoded features to {feature_dir}")
 
     # ── PLY renderer (aligned space) ──────────────────────────────────────────
     o3d_ren = None
@@ -764,13 +862,15 @@ def step2_scaffold_render(ply_path: str,
     depth_supported = None
     print(f"  [SGS] 렌더링 시작: {n} viewpoints  (PLY compare: {save_ply_compare and o3d_ren_deferred is not None}, "
           f"PLY depth fallback: {save_ply_depth and o3d_ren_deferred is not None})")
+    render_params = inspect.signature(gs_render).parameters
+    supports_render_depth_kw = "render_depth" in render_params
 
     for idx, vp in enumerate(viewpoints):
         if "_camera" in vp:
             cam = vp["_camera"]
             c2w_model = np.array(vp["_c2w_model"], dtype=np.float64)
         else:
-            c2w_model = T_inv @ np.array(vp["pose"], dtype=np.float64)
+            c2w_model = T_aligned_to_model @ np.array(vp["pose"], dtype=np.float64)
             vp_has_uid = "_uid" in vp
             render_uid = int(vp.get("_uid", idx))
             if gaussians.appearance_dim > 0 and not vp_has_uid:
@@ -794,10 +894,15 @@ def step2_scaffold_render(ply_path: str,
 
         with torch.no_grad():
             voxel_mask = prefilter_voxel(cam, gaussians, pipeline, background)
-            pkg        = gs_render(cam, gaussians, pipeline, background,
-                                   visible_mask=voxel_mask)
+            render_kwargs = {
+                "visible_mask": voxel_mask,
+                "render_feature": has_feat,
+            }
+            if supports_render_depth_kw:
+                render_kwargs["render_depth"] = True
+            pkg = gs_render(cam, gaussians, pipeline, background, **render_kwargs)
         if depth_supported is None:
-            depth_supported = "depth" in pkg
+            depth_supported = ("depth" in pkg) or (pkg.get("rendered_depth", None) is not None)
             if not depth_supported:
                 print("  [SGS] depth 미저장: 현재 renderer가 depth tensor를 반환하지 않습니다.")
                 if save_ply_depth and o3d_ren_deferred is not None:
@@ -819,11 +924,33 @@ def step2_scaffold_render(ply_path: str,
         # Depth 저장 (native gaussian depth 가 있을 때만)
         dep_path = ""
         depth_source = ""
-        if "depth" in pkg:
-            depth    = pkg["depth"][0].cpu().numpy()
+        depth_tensor = pkg.get("depth", None)
+        if depth_tensor is None:
+            depth_tensor = pkg.get("rendered_depth", None)
+        if depth_tensor is not None:
+            depth    = depth_tensor[0].detach().cpu().numpy()
             dep_path = os.path.join(depth_dir, f"{name}.npy")
             np.save(dep_path, depth.astype(np.float32))
             depth_source = "gaussian"
+
+        # Feature 저장 (decoder lifts C'→C; saves at H/8 × W/8 like SuperPoint desc)
+        feat_path = ""
+        feature_shape = None
+        feature_stride = None
+        if has_feat and pkg.get("rendered_feature", None) is not None:
+            with torch.no_grad():
+                F_low = pkg["rendered_feature"].unsqueeze(0)            # (1,C',H,W)
+                Hf = max(1, F_low.shape[-2] // 8)
+                Wf = max(1, F_low.shape[-1] // 8)
+                F_low = torch.nn.functional.interpolate(
+                    F_low, size=(Hf, Wf), mode="bilinear", align_corners=False)
+                F_high = gaussians.feat_decoder(F_low)                  # (1,C,H/8,W/8)
+                F_high = torch.nn.functional.normalize(F_high, dim=1)
+                feat_np = F_high[0].cpu().numpy().astype(np.float32)    # (C, H/8, W/8)
+            feat_path = os.path.join(feature_dir, f"{name}.npy")
+            np.save(feat_path, feat_np)
+            feature_shape = tuple(int(x) for x in feat_np.shape)
+            feature_stride = int(round(render_h / max(1, feat_np.shape[-2])))
 
         rendered.append({
             "id":           vp["id"],
@@ -834,6 +961,10 @@ def step2_scaffold_render(ply_path: str,
             "ply_rgb_path": "",
             "depth_path":   dep_path,
             "depth_source": depth_source,
+            "feature_path": feat_path,
+            "feature_shape": feature_shape,
+            "feature_stride": feature_stride,
+            "feature_type": "scaffold_gs_feature",
         })
 
         if (idx + 1) % 100 == 0 or (idx + 1) == n:
@@ -849,50 +980,51 @@ def step2_scaffold_render(ply_path: str,
     print(f"  [SGS] pass-1 완료: {len(rendered)}/{n}  avg {avg_fps:.2f} fps")
 
     # ── Pass-2: PLY depth / compare (O3D) ────────────────────────────────────
-    # if need_ply_pass:
-    #     torch.cuda.empty_cache()
-    #     o3d_ren = o3d_ren_deferred
-    #     need_any_ply_rgb   = save_ply_compare
-    #     need_any_ply_depth = save_ply_depth and not depth_supported
-    #     print(f"  [SGS] pass-2 PLY 렌더 시작 (rgb={need_any_ply_rgb}, depth={need_any_ply_depth})")
-    #     for idx, (vp, rec) in enumerate(zip(viewpoints, rendered)):
-    #         need_ply_rgb   = need_any_ply_rgb
-    #         need_ply_depth = need_any_ply_depth and not rec["depth_path"]
-    #         if not need_ply_rgb and not need_ply_depth:
-    #             continue
-    #         ply_rgb, ply_depth = _render_ply_o3d(
-    #             o3d_ren,
-    #             np.array(vp["pose"], dtype=np.float64),
-    #             config,
-    #             with_rgb=need_ply_rgb,
-    #             with_depth=need_ply_depth,
-    #         )
-    #         name = f"{vp['id']:05d}"
-    #         if need_ply_rgb and ply_rgb is not None:
-    #             os.makedirs(ply_dir, exist_ok=True)
-    #             ply_rgb_path = os.path.join(ply_dir, f"{name}.png")
-    #             cv2.imwrite(ply_rgb_path, cv2.cvtColor(ply_rgb, cv2.COLOR_RGB2BGR))
-    #             rec["ply_rgb_path"] = ply_rgb_path
-    #         if need_ply_depth and ply_depth is not None:
-    #             dep_path = os.path.join(depth_dir, f"{name}.npy")
-    #             np.save(dep_path, ply_depth.astype(np.float32))
-    #             rec["depth_path"]   = dep_path
-    #             rec["depth_source"] = "ply"
-    #         if (idx + 1) % 100 == 0 or (idx + 1) == n:
-    #             print(f"    PLY {idx+1}/{n}")
-    #     print(f"  [SGS] pass-2 완료")
+    if need_ply_pass:
+        torch.cuda.empty_cache()
+        o3d_ren = o3d_ren_deferred
+        need_any_ply_rgb   = save_ply_compare
+        need_any_ply_depth = save_ply_depth and not depth_supported
+        print(f"  [SGS] pass-2 PLY 렌더 시작 (rgb={need_any_ply_rgb}, depth={need_any_ply_depth})")
+        for idx, (vp, rec) in enumerate(zip(viewpoints, rendered)):
+            need_ply_rgb   = need_any_ply_rgb
+            need_ply_depth = need_any_ply_depth and not rec["depth_path"]
+            if not need_ply_rgb and not need_ply_depth:
+                continue
+            ply_rgb, ply_depth = _render_ply_o3d(
+                o3d_ren,
+                np.array(vp["pose"], dtype=np.float64),
+                config,
+                with_rgb=need_ply_rgb,
+                with_depth=need_ply_depth,
+            )
+            name = f"{vp['id']:05d}"
+            if need_ply_rgb and ply_rgb is not None:
+                os.makedirs(ply_dir, exist_ok=True)
+                ply_rgb_path = os.path.join(ply_dir, f"{name}.png")
+                cv2.imwrite(ply_rgb_path, cv2.cvtColor(ply_rgb, cv2.COLOR_RGB2BGR))
+                rec["ply_rgb_path"] = ply_rgb_path
+            if need_ply_depth and ply_depth is not None:
+                dep_path = os.path.join(depth_dir, f"{name}.npy")
+                np.save(dep_path, ply_depth.astype(np.float32))
+                rec["depth_path"]   = dep_path
+                rec["depth_source"] = "ply"
+            if (idx + 1) % 100 == 0 or (idx + 1) == n:
+                print(f"    PLY {idx+1}/{n}")
+        print(f"  [SGS] pass-2 완료")
 
     # ── 샘플 시각화 ───────────────────────────────────────────────────────────
     if rendered:
         ns       = min(8, len(rendered))
         idx_list = np.linspace(0, len(rendered) - 1, ns, dtype=int)
 
-        nrows = 2   # SGS / Depth
+        show_feature = has_feat and any(rendered[i].get("feature_path") for i in idx_list)
+        nrows = 3 if show_feature else 2  # SGS / Depth / (Feature)
         fig, axes = plt.subplots(nrows, ns, figsize=(4 * ns, 4 * nrows))
         if ns == 1:
             axes = axes.reshape(nrows, 1)
 
-        row_labels = ["SGS", "Depth"]
+        row_labels = ["SGS", "Depth"] + (["Feature"] if show_feature else [])
 
         for c, ii in enumerate(idx_list):
             r = rendered[ii]
@@ -915,6 +1047,28 @@ def step2_scaffold_render(ply_path: str,
                 axes[1, c].text(0.5, 0.5, "no depth", ha="center", va="center",
                                 transform=axes[1, c].transAxes, fontsize=10, color="gray")
             axes[1, c].axis("off")
+
+            if show_feature:
+                feat_path = r.get("feature_path", "")
+                if feat_path and os.path.exists(feat_path):
+                    feat = np.load(feat_path).astype(np.float32)   # (C, H, W)
+                    C, Hf, Wf = feat.shape
+                    flat = feat.reshape(C, -1).T                   # (HW, C)
+                    flat = flat - flat.mean(axis=0, keepdims=True)
+                    # PCA via SVD on small (HW × C) matrix
+                    try:
+                        u, s, vt = np.linalg.svd(flat, full_matrices=False)
+                        proj = (u[:, :3] * s[:3]).reshape(Hf, Wf, 3)
+                    except np.linalg.LinAlgError:
+                        proj = flat[:, :3].reshape(Hf, Wf, 3)
+                    lo = np.percentile(proj, 2, axis=(0, 1), keepdims=True)
+                    hi = np.percentile(proj, 98, axis=(0, 1), keepdims=True)
+                    rgb_vis = np.clip((proj - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+                    axes[2, c].imshow(rgb_vis)
+                else:
+                    axes[2, c].text(0.5, 0.5, "no feature", ha="center", va="center",
+                                    transform=axes[2, c].transAxes, fontsize=10, color="gray")
+                axes[2, c].axis("off")
 
         for row, lbl in enumerate(row_labels):
             axes[row, 0].set_ylabel(lbl, fontsize=11)
