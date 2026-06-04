@@ -8,6 +8,38 @@ from matplotlib.gridspec import GridSpec
 from .multi_cam import parse_kapture_rigs, parse_kapture_sensors, load_multi_cam_config
 
 
+def _load_ref_depth(ref_entry):
+    path = ref_entry.get("depth_path", "")
+    if not path or not os.path.exists(path):
+        return None
+    if path.endswith(".npy"):
+        return np.load(path)
+    if path.endswith(".depth"):
+        cam = ref_entry.get("camera", {}) or {}
+        h = int(ref_entry.get("height") or cam.get("height") or 0)
+        w = int(ref_entry.get("width") or cam.get("width") or 0)
+        arr = np.fromfile(path, dtype=np.float32)
+        if h <= 0 or w <= 0:
+            if arr.size == 1200 * 1920:
+                h, w = 1200, 1920
+            elif arr.size == 1:
+                return None
+            else:
+                return None
+        if arr.size == h * w:
+            return arr.reshape(h, w)
+    return None
+
+
+def _K_from_ref_entry(ref_entry, fallback_K):
+    cam = ref_entry.get("camera", {}) or {}
+    if all(k in cam for k in ("fx", "fy", "cx", "cy")):
+        return np.array([[cam["fx"], 0, cam["cx"]],
+                         [0, cam["fy"], cam["cy"]],
+                         [0, 0, 1]], dtype=np.float64)
+    return fallback_K
+
+
 # ── PnP solvers ────────────────────────────────────────────────────────────
 
 def _solve_pnp_opencv(pts2d, pts3d, K, config):
@@ -109,21 +141,331 @@ def _refine_pnp(pts2d_in, pts3d_in, K, rvec_init, tvec_init):
     return rvec_r, tvec_r
 
 
+# ── Point + line pose refinement ───────────────────────────────────────────
+
+def _project_world_points_pose(T_WQ, pts3d_world, K):
+    """World 3D points를 query image pixel로 투영."""
+    if len(pts3d_world) == 0:
+        return np.zeros((0, 2)), np.zeros((0,), dtype=bool)
+    R_WQ = T_WQ[:3, :3]
+    t_WQ = T_WQ[:3, 3]
+    pts_q = (R_WQ.T @ (pts3d_world - t_WQ).T).T
+    z = pts_q[:, 2]
+    valid = np.isfinite(z) & (z > 1e-6)
+    uv = np.zeros((len(pts_q), 2), dtype=np.float64)
+    uv[valid, 0] = K[0, 0] * pts_q[valid, 0] / z[valid] + K[0, 2]
+    uv[valid, 1] = K[1, 1] * pts_q[valid, 1] / z[valid] + K[1, 2]
+    valid &= np.isfinite(uv).all(axis=1)
+    return uv, valid
+
+
+def _line_coeff_from_xy(line_xy):
+    """2D line segment endpoints(xy) → normalized infinite-line coeff [a,b,c]."""
+    p0 = np.asarray(line_xy[0], dtype=np.float64)
+    p1 = np.asarray(line_xy[1], dtype=np.float64)
+    a = p0[1] - p1[1]
+    b = p1[0] - p0[0]
+    c = p0[0] * p1[1] - p1[0] * p0[1]
+    n = np.hypot(a, b)
+    if n < 1e-9:
+        return None
+    return np.array([a / n, b / n, c / n], dtype=np.float64)
+
+
+def _depth_at_nearest(depth, xy, dmin, dmax, radius_px=0):
+    x, y = float(xy[0]), float(xy[1])
+    i, j = int(round(y)), int(round(x))
+    if not (0 <= i < depth.shape[0] and 0 <= j < depth.shape[1]):
+        return None
+    r = int(max(0, radius_px))
+    y0, y1 = max(0, i - r), min(depth.shape[0], i + r + 1)
+    x0, x1 = max(0, j - r), min(depth.shape[1], j + r + 1)
+    patch = depth[y0:y1, x0:x1]
+    valid = patch[np.isfinite(patch) & (patch >= dmin) & (patch <= dmax)]
+    if valid.size == 0:
+        return None
+    return float(valid.min())
+
+
+def _lift_line_matches_to_world(line_matches, ref_entry, K_render, dmin, dmax, lookup_radius_px=0):
+    """SOLD2 2D line matches의 ref endpoints를 depth로 3D world line segment로 lift."""
+    q_lines = np.asarray(line_matches.get("query_lines", []), dtype=np.float64)
+    r_lines = np.asarray(line_matches.get("ref_lines", []), dtype=np.float64)
+    if q_lines.ndim != 3 or r_lines.ndim != 3 or len(q_lines) == 0:
+        return np.zeros((0, 2, 2)), np.zeros((0, 2, 3))
+
+    depth = _load_ref_depth(ref_entry)
+    if depth is None:
+        return np.zeros((0, 2, 2)), np.zeros((0, 2, 3))
+    T_WR = np.asarray(ref_entry["pose"], dtype=np.float64)
+    fx, fy = K_render[0, 0], K_render[1, 1]
+    cx, cy = K_render[0, 2], K_render[1, 2]
+
+    q_keep = []
+    world_keep = []
+    for q_line, r_line in zip(q_lines, r_lines):
+        coeff = _line_coeff_from_xy(q_line)
+        if coeff is None:
+            continue
+        pts_ref = []
+        ok = True
+        for xy in r_line:
+            z = _depth_at_nearest(depth, xy, dmin, dmax, lookup_radius_px)
+            if z is None:
+                ok = False
+                break
+            x = (xy[0] - cx) * z / fx
+            y = (xy[1] - cy) * z / fy
+            pts_ref.append([x, y, z])
+        if not ok:
+            continue
+        pts_ref_h = np.hstack([np.asarray(pts_ref), np.ones((2, 1))])
+        pts_world = (T_WR @ pts_ref_h.T).T[:, :3]
+        q_keep.append(q_line)
+        world_keep.append(pts_world)
+
+    if not q_keep:
+        return np.zeros((0, 2, 2)), np.zeros((0, 2, 3))
+    return np.asarray(q_keep, dtype=np.float64), np.asarray(world_keep, dtype=np.float64)
+
+
+def _line_distance_residuals(T_WQ, q_lines, line3d_world, K):
+    """Projected 3D line endpoints와 query 2D infinite-line 사이 거리 residual(px)."""
+    if len(q_lines) == 0:
+        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=bool)
+    all_pts = line3d_world.reshape(-1, 3)
+    uv, valid_pt = _project_world_points_pose(T_WQ, all_pts, K)
+    uv = uv.reshape(-1, 2, 2)
+    valid_pair = valid_pt.reshape(-1, 2).all(axis=1)
+
+    residuals = []
+    valid_lines = []
+    for i, q_line in enumerate(q_lines):
+        coeff = _line_coeff_from_xy(q_line)
+        if coeff is None or not valid_pair[i]:
+            residuals.extend([1e3, 1e3])
+            valid_lines.append(False)
+            continue
+        d = uv[i] @ coeff[:2] + coeff[2]
+        residuals.extend(d.tolist())
+        valid_lines.append(True)
+    return np.asarray(residuals, dtype=np.float64), np.asarray(valid_lines, dtype=bool)
+
+
+def _pose_to_params(T_WQ):
+    from scipy.spatial.transform import Rotation
+
+    rvec = Rotation.from_matrix(T_WQ[:3, :3]).as_rotvec()
+    return np.hstack([rvec, T_WQ[:3, 3]])
+
+
+def _params_to_pose(params):
+    from scipy.spatial.transform import Rotation
+
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = Rotation.from_rotvec(params[:3]).as_matrix()
+    T[:3, 3] = params[3:6]
+    return T
+
+
+def _rmse(x):
+    x = np.asarray(x, dtype=np.float64)
+    return float(np.sqrt(np.mean(x * x))) if len(x) else float("inf")
+
+
+def _refine_pose_points_lines(T_init, pts2d, pts3d_world, q_lines, line3d_world,
+                              K, config):
+    """PnP pose를 초기값으로 point reprojection + line endpoint-to-line residual을 LM refine."""
+    from scipy.optimize import least_squares
+
+    pnp = config.get("pnp", {})
+    min_lines = int(pnp.get("line_refine_min_lines", 3))
+    if len(q_lines) < min_lines:
+        return None, {"success": False, "reason": "not_enough_lines",
+                      "n_lines": int(len(q_lines))}
+
+    line_thr = float(pnp.get("line_refine_inlier_threshold", 12.0))
+    line_res0, line_valid0 = _line_distance_residuals(T_init, q_lines, line3d_world, K)
+    if len(line_res0):
+        pair_res0 = np.abs(line_res0.reshape(-1, 2))
+        keep = line_valid0 & (np.max(pair_res0, axis=1) <= line_thr)
+        if int(keep.sum()) >= min_lines:
+            q_lines = q_lines[keep]
+            line3d_world = line3d_world[keep]
+
+    if len(q_lines) < min_lines:
+        return None, {"success": False, "reason": "not_enough_line_inliers",
+                      "n_lines": int(len(q_lines))}
+
+    point_weight = float(pnp.get("line_refine_point_weight", 1.0))
+    line_weight = float(pnp.get("line_refine_line_weight", 0.7))
+
+    def residual(params):
+        T = _params_to_pose(params)
+        chunks = []
+        if len(pts2d) > 0:
+            uv, valid = _project_world_points_pose(T, pts3d_world, K)
+            point_res = uv - pts2d
+            point_res[~valid] = 1e3
+            chunks.append(point_weight * point_res.reshape(-1))
+        line_res, _ = _line_distance_residuals(T, q_lines, line3d_world, K)
+        chunks.append(line_weight * line_res)
+        return np.concatenate(chunks) if chunks else np.zeros((0,), dtype=np.float64)
+
+    x0 = _pose_to_params(T_init)
+    before = residual(x0)
+    opt = least_squares(
+        residual, x0,
+        loss=pnp.get("line_refine_loss", "huber"),
+        f_scale=float(pnp.get("line_refine_fscale", 5.0)),
+        max_nfev=int(pnp.get("line_refine_max_nfev", 40)),
+        xtol=1e-6, ftol=1e-6, gtol=1e-6,
+    )
+    T_refined = _params_to_pose(opt.x)
+    after = residual(opt.x)
+
+    stats = {
+        "success": bool(opt.success),
+        "cost_before": float(0.5 * np.sum(before * before)),
+        "cost_after": float(0.5 * np.sum(after * after)),
+        "rmse_before": _rmse(before),
+        "rmse_after": _rmse(after),
+        "n_points": int(len(pts2d)),
+        "n_lines": int(len(q_lines)),
+        "nfev": int(opt.nfev),
+    }
+    return T_refined, stats
+
+
+def _line_distance_residuals_rig(T_W_rig, T_rig_to_cam, q_lines, line3d_world, K):
+    """Rig pose 기준 projected 3D line endpoints와 query line 사이 거리 residual(px)."""
+    if len(q_lines) == 0:
+        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=bool)
+    all_pts = line3d_world.reshape(-1, 3)
+    uv, valid_pt = _project_world_points(T_W_rig, T_rig_to_cam, all_pts, K)
+    uv = uv.reshape(-1, 2, 2)
+    valid_pair = valid_pt.reshape(-1, 2).all(axis=1)
+
+    residuals = []
+    valid_lines = []
+    for i, q_line in enumerate(q_lines):
+        coeff = _line_coeff_from_xy(q_line)
+        if coeff is None or not valid_pair[i]:
+            residuals.extend([1e3, 1e3])
+            valid_lines.append(False)
+            continue
+        d = uv[i] @ coeff[:2] + coeff[2]
+        residuals.extend(d.tolist())
+        valid_lines.append(True)
+    return np.asarray(residuals, dtype=np.float64), np.asarray(valid_lines, dtype=bool)
+
+
+def _refine_rig_pose_points_lines(T_init, cam_result, line_matches, K_render, config):
+    """Multi-cam rig pose를 best cam의 point inliers + SOLD2 lines로 추가 refine."""
+    from scipy.optimize import least_squares
+
+    pnp = config.get("pnp", {})
+    dmin = float(config["camera"].get("depth_min", 0.3))
+    dmax = float(config["camera"].get("depth_max", 20.0))
+    min_lines = int(pnp.get("line_refine_min_lines", 3))
+
+    entry = cam_result.get("entry")
+    T_rig_to_cam = cam_result.get("T_rig_to_cam")
+    if entry is None:
+        return None, {"success": False, "reason": "missing_entry"}
+    if T_rig_to_cam is None:
+        T_rig_to_cam = np.eye(4, dtype=np.float64)
+
+    q_lines, line3d_world = _lift_line_matches_to_world(
+        line_matches, entry, K_render, dmin, dmax)
+    if len(q_lines) < min_lines:
+        return None, {"success": False, "reason": "not_enough_lines",
+                      "n_lines": int(len(q_lines))}
+
+    K_query = cam_result.get("K_query", K_render)
+    pts2d = np.asarray(cam_result.get("pts2d", np.zeros((0, 2))), dtype=np.float64)
+    pts3d_cam = np.asarray(cam_result.get("pts3d_cam", np.zeros((0, 3))), dtype=np.float64)
+    inlier_idx = np.asarray(cam_result.get("pnp_inlier_idx", []), dtype=int)
+    if len(inlier_idx) > 0:
+        pts2d = pts2d[inlier_idx]
+        pts3d_cam = pts3d_cam[inlier_idx]
+    if len(pts3d_cam) > 0:
+        T_WR = np.asarray(entry["pose"], dtype=np.float64)
+        pts3d_h = np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))])
+        pts3d_world = (T_WR @ pts3d_h.T).T[:, :3]
+    else:
+        pts3d_world = np.zeros((0, 3), dtype=np.float64)
+
+    line_thr = float(pnp.get("line_refine_inlier_threshold", 12.0))
+    line_res0, line_valid0 = _line_distance_residuals_rig(
+        T_init, T_rig_to_cam, q_lines, line3d_world, K_query)
+    if len(line_res0):
+        pair_res0 = np.abs(line_res0.reshape(-1, 2))
+        keep = line_valid0 & (np.max(pair_res0, axis=1) <= line_thr)
+        if int(keep.sum()) >= min_lines:
+            q_lines = q_lines[keep]
+            line3d_world = line3d_world[keep]
+    if len(q_lines) < min_lines:
+        return None, {"success": False, "reason": "not_enough_line_inliers",
+                      "n_lines": int(len(q_lines))}
+
+    point_weight = float(pnp.get("line_refine_point_weight", 1.0))
+    line_weight = float(pnp.get("line_refine_line_weight", 0.7))
+
+    def residual(params):
+        T = _params_to_pose(params)
+        chunks = []
+        if len(pts2d) > 0:
+            uv, valid = _project_world_points(T, T_rig_to_cam, pts3d_world, K_query)
+            point_res = uv - pts2d
+            point_res[~valid] = 1e3
+            chunks.append(point_weight * point_res.reshape(-1))
+        line_res, _ = _line_distance_residuals_rig(
+            T, T_rig_to_cam, q_lines, line3d_world, K_query)
+        chunks.append(line_weight * line_res)
+        return np.concatenate(chunks)
+
+    x0 = _pose_to_params(T_init)
+    before = residual(x0)
+    opt = least_squares(
+        residual, x0,
+        loss=pnp.get("line_refine_loss", "huber"),
+        f_scale=float(pnp.get("line_refine_fscale", 5.0)),
+        max_nfev=int(pnp.get("line_refine_max_nfev", 40)),
+        xtol=1e-6, ftol=1e-6, gtol=1e-6,
+    )
+    after = residual(opt.x)
+    stats = {
+        "success": bool(opt.success),
+        "cost_before": float(0.5 * np.sum(before * before)),
+        "cost_after": float(0.5 * np.sum(after * after)),
+        "rmse_before": _rmse(before),
+        "rmse_after": _rmse(after),
+        "n_points": int(len(pts2d)),
+        "n_lines": int(len(q_lines)),
+        "nfev": int(opt.nfev),
+    }
+    return _params_to_pose(opt.x), stats
+
+
 # ── Multi-cam PnP helper ───────────────────────────────────────────────────
 
 def _lift_2d_to_3d(mkpts_r, ref_entry, K_render, dmin, dmax):
     """렌더 이미지의 2D 매칭점 → ref cam frame 3D점 (depth lifting)."""
-    dep = np.load(ref_entry["depth_path"])
+    dep = _load_ref_depth(ref_entry)
+    if dep is None:
+        return np.array(pts3d_cam, dtype=np.float64), np.array(valid_idx, dtype=int)
     fx_r, fy_r = K_render[0, 0], K_render[1, 1]
     cx_r, cy_r = K_render[0, 2], K_render[1, 2]
+    lookup_radius = ref_entry.get("depth_lookup_radius_px", None)
+    if lookup_radius is None:
+        lookup_radius = 2 if str(ref_entry.get("depth_path", "")).endswith(".depth") else 0
+    lookup_radius = int(lookup_radius)
     pts3d_cam = []
     valid_idx = []
     for i, (ru, rv) in enumerate(mkpts_r):
-        ri, rj = int(round(rv)), int(round(ru))
-        if not (0 <= ri < dep.shape[0] and 0 <= rj < dep.shape[1]):
-            continue
-        pz = float(dep[ri, rj])
-        if not np.isfinite(pz) or pz < dmin or pz > dmax:
+        pz = _depth_at_nearest(dep, (ru, rv), dmin, dmax, lookup_radius)
+        if pz is None:
             continue
         pts3d_cam.append([(ru - cx_r) * pz / fx_r,
                            (rv - cy_r) * pz / fy_r,
@@ -454,10 +796,13 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
     refine (config.pnp.refine = true):
       RANSAC 후 inlier만으로 cv2.solvePnP ITERATIVE refine
     """
-    print("\n" + "="*60 + "\nSTEP 7: 2D-3D correspondence + PnP\n" + "="*60)
-
     cam = config["camera"]
     pnp = config.get("pnp", {})
+    line_label = " + point-line refinement" if bool(pnp.get("line_refine", False)) else ""
+    print("\n" + "="*60 +
+          f"\nSTEP 7: 2D-3D pose estimation (PnP{line_label})"
+          "\n" + "="*60)
+
     fx, fy = cam["fx"], cam["fy"]
     cx, cy = cam["cx"], cam["cy"]
     K      = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
@@ -493,6 +838,7 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
     pnp_cams_used  = []
     best_pnp_cam   = None
     joint_stats    = {}
+    line_refine_stats = {}
     pnp_results    = {}
     pose_selection = {}
 
@@ -525,12 +871,16 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
                 K_q = np.array([[s["fx"], 0, s["cx"]],
                                  [0, s["fy"], s["cy"]],
                                  [0, 0, 1]], dtype=np.float64)
+                print(f"    [{cam_id}] query K from sensors.txt: "
+                      f"fx={s['fx']:.1f} fy={s['fy']:.1f} "
+                      f"cx={s['cx']:.1f} cy={s['cy']:.1f}")
             else:
                 K_q = K_render
                 print(f"    [{cam_id}] sensors.txt 미존재 → config K 사용")
 
+            K_ref = _K_from_ref_entry(cam_entries[cam_id], K_render)
             c2w_cam, n_in, p2d, p3d, inlier_idx = _pnp_cam(
-                mq, mr, cam_entries[cam_id], K_q, K_render, config, cam_id)
+                mq, mr, cam_entries[cam_id], K_q, K_ref, config, cam_id)
 
             if cam_id == mc_primary:
                 pts2d, pts3d_cam = p2d, p3d  # 시각화용
@@ -695,6 +1045,34 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
                     ref_rgb = cv2.cvtColor(
                         cv2.imread(ref_entry["rgb_path"]), cv2.COLOR_BGR2RGB)
 
+            if bool(pnp.get("line_refine", False)):
+                line_matches = step6_data.get("line_matches") or {}
+                line_n = int(line_matches.get("n_matches", 0))
+                line_cam = line_matches.get("cam_id")
+                if line_n > 0 and line_cam in (None, pnp_cam_for_viz):
+                    refined_pose, stats = _refine_rig_pose_points_lines(
+                        estimated_pose, pnp_results[pnp_cam_for_viz],
+                        line_matches, K_render, config)
+                    line_refine_stats = stats
+                    if (refined_pose is not None and stats.get("success", False)
+                            and stats.get("cost_after", float("inf"))
+                            <= stats.get("cost_before", float("inf"))):
+                        estimated_pose = refined_pose
+                        pnp_method = f"{pnp_method}+line_refine"
+                        print("  Multi-cam point+line refine: "
+                              f"cam={pnp_cam_for_viz}  "
+                              f"points={stats['n_points']}  lines={stats['n_lines']}  "
+                              f"rmse {stats['rmse_before']:.2f}"
+                              f"→{stats['rmse_after']:.2f}px")
+                    else:
+                        print(f"  Multi-cam point+line refine skipped: "
+                              f"{stats.get('reason', 'optimization_failed')}")
+                elif line_n > 0:
+                    print(f"  Multi-cam point+line refine skipped: "
+                          f"SOLD2 cam={line_cam}, PnP cam={pnp_cam_for_viz}")
+                else:
+                    print("  Multi-cam point+line refine skipped: no SOLD2 line matches")
+
             print(f"  Multi-cam rig position: {estimated_pose[:3,3].round(4)}")
         else:
             print("  Multi-cam PnP 전 cam 실패 → single-cam fallback")
@@ -737,7 +1115,10 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
                           f"fx={s['fx']:.1f}  fy={s['fy']:.1f}  "
                           f"cx={s['cx']:.1f}  cy={s['cy']:.1f}")
 
-        dep = np.load(ref_entry["depth_path"])
+        K_render = _K_from_ref_entry(ref_entry, K_render)
+        dep = _load_ref_depth(ref_entry)
+        if dep is None:
+            dep = np.zeros((0, 0), dtype=np.float32)
         # 3D lifting은 K_render 사용 (렌더는 항상 config 파라미터로 생성)
         pts2d_list = []; pts3d_list = []; invalid = 0
         for i in range(len(matched_q)):
@@ -811,6 +1192,44 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
                 print(f"  T_WQ position: {estimated_pose[:3,3].round(4)}")
             else:
                 print("  OpenCV PnP FAILED: insufficient inliers")
+
+        if estimated_pose is not None and bool(pnp.get("line_refine", False)):
+            line_matches = step6_data.get("line_matches") or {}
+            line_n = int(line_matches.get("n_matches", 0))
+            if line_n > 0:
+                # PnP inliers만 point residual에 사용하고, SOLD2 lines는 별도 line residual로 사용.
+                if len(inlier_idx) > 0:
+                    p2d_ref = pts2d[inlier_idx]
+                    p3d_ref_cam = pts3d_cam[inlier_idx]
+                else:
+                    p2d_ref = pts2d
+                    p3d_ref_cam = pts3d_cam
+                if len(p3d_ref_cam) > 0:
+                    p3d_ref_h = np.hstack([
+                        p3d_ref_cam, np.ones((len(p3d_ref_cam), 1))])
+                    p3d_ref_world = (T_WR @ p3d_ref_h.T).T[:, :3]
+                else:
+                    p3d_ref_world = np.zeros((0, 3), dtype=np.float64)
+
+                q_lines, line3d_world = _lift_line_matches_to_world(
+                    line_matches, ref_entry, K_render, dmin, dmax)
+                refined_pose, stats = _refine_pose_points_lines(
+                    estimated_pose, p2d_ref, p3d_ref_world,
+                    q_lines, line3d_world, K_query, config)
+                line_refine_stats = stats
+                if refined_pose is not None and stats.get("success", False):
+                    estimated_pose = refined_pose
+                    pnp_method = f"{pnp_method}+line_refine"
+                    print("  Point+line refine: "
+                          f"points={stats['n_points']}  lines={stats['n_lines']}  "
+                          f"rmse {stats['rmse_before']:.2f}"
+                          f"→{stats['rmse_after']:.2f}px  "
+                          f"pos={estimated_pose[:3,3].round(4)}")
+                else:
+                    print(f"  Point+line refine skipped: "
+                          f"{stats.get('reason', 'optimization_failed')}")
+            else:
+                print("  Point+line refine skipped: no SOLD2 line matches")
 
     # ── Rig frame 정규화 (single-cam 경로) ──────────────────────────────────
     # multi-cam PnP 경로는 이미 rig frame으로 변환됨.
@@ -1015,6 +1434,7 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
         "pnp_cams_used":     pnp_cams_used,
         "best_pnp_cam":      best_pnp_cam,
         "joint_refine_stats": joint_stats,
+        "line_refine_stats": line_refine_stats,
         "pose_selection":    pose_selection,
     }
     if save_images:

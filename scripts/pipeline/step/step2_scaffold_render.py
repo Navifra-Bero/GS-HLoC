@@ -29,7 +29,7 @@ Usage (main.py):
   # train.py / render.py 방식 (실제 학습 카메라 사용):
   python3 scripts/main.py ... --sgs_use_train_cameras
 """
-import os, sys, ast, pickle, time, json, types
+import os, sys, ast, pickle, time, json, types, inspect
 import numpy as np
 import torch
 import torchvision
@@ -862,6 +862,8 @@ def step2_scaffold_render(ply_path: str,
     depth_supported = None
     print(f"  [SGS] 렌더링 시작: {n} viewpoints  (PLY compare: {save_ply_compare and o3d_ren_deferred is not None}, "
           f"PLY depth fallback: {save_ply_depth and o3d_ren_deferred is not None})")
+    render_params = inspect.signature(gs_render).parameters
+    supports_render_depth_kw = "render_depth" in render_params
 
     for idx, vp in enumerate(viewpoints):
         if "_camera" in vp:
@@ -892,10 +894,13 @@ def step2_scaffold_render(ply_path: str,
 
         with torch.no_grad():
             voxel_mask = prefilter_voxel(cam, gaussians, pipeline, background)
-            pkg        = gs_render(cam, gaussians, pipeline, background,
-                                   visible_mask=voxel_mask,
-                                   render_feature=has_feat,
-                                   render_depth=True)
+            render_kwargs = {
+                "visible_mask": voxel_mask,
+                "render_feature": has_feat,
+            }
+            if supports_render_depth_kw:
+                render_kwargs["render_depth"] = True
+            pkg = gs_render(cam, gaussians, pipeline, background, **render_kwargs)
         if depth_supported is None:
             depth_supported = ("depth" in pkg) or (pkg.get("rendered_depth", None) is not None)
             if not depth_supported:
@@ -1013,12 +1018,13 @@ def step2_scaffold_render(ply_path: str,
         ns       = min(8, len(rendered))
         idx_list = np.linspace(0, len(rendered) - 1, ns, dtype=int)
 
-        nrows = 2   # SGS / Depth
+        show_feature = has_feat and any(rendered[i].get("feature_path") for i in idx_list)
+        nrows = 3 if show_feature else 2  # SGS / Depth / (Feature)
         fig, axes = plt.subplots(nrows, ns, figsize=(4 * ns, 4 * nrows))
         if ns == 1:
             axes = axes.reshape(nrows, 1)
 
-        row_labels = ["SGS", "Depth"]
+        row_labels = ["SGS", "Depth"] + (["Feature"] if show_feature else [])
 
         for c, ii in enumerate(idx_list):
             r = rendered[ii]
@@ -1041,6 +1047,28 @@ def step2_scaffold_render(ply_path: str,
                 axes[1, c].text(0.5, 0.5, "no depth", ha="center", va="center",
                                 transform=axes[1, c].transAxes, fontsize=10, color="gray")
             axes[1, c].axis("off")
+
+            if show_feature:
+                feat_path = r.get("feature_path", "")
+                if feat_path and os.path.exists(feat_path):
+                    feat = np.load(feat_path).astype(np.float32)   # (C, H, W)
+                    C, Hf, Wf = feat.shape
+                    flat = feat.reshape(C, -1).T                   # (HW, C)
+                    flat = flat - flat.mean(axis=0, keepdims=True)
+                    # PCA via SVD on small (HW × C) matrix
+                    try:
+                        u, s, vt = np.linalg.svd(flat, full_matrices=False)
+                        proj = (u[:, :3] * s[:3]).reshape(Hf, Wf, 3)
+                    except np.linalg.LinAlgError:
+                        proj = flat[:, :3].reshape(Hf, Wf, 3)
+                    lo = np.percentile(proj, 2, axis=(0, 1), keepdims=True)
+                    hi = np.percentile(proj, 98, axis=(0, 1), keepdims=True)
+                    rgb_vis = np.clip((proj - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+                    axes[2, c].imshow(rgb_vis)
+                else:
+                    axes[2, c].text(0.5, 0.5, "no feature", ha="center", va="center",
+                                    transform=axes[2, c].transAxes, fontsize=10, color="gray")
+                axes[2, c].axis("off")
 
         for row, lbl in enumerate(row_labels):
             axes[row, 0].set_ylabel(lbl, fontsize=11)

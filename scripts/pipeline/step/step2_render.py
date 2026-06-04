@@ -442,12 +442,63 @@ def _render_pointcloud(ply_path, viewpoints, config, output_dir, step0_data=None
 # =============================================================================
 def _resolve_aligned_ply_path(ply_path, output_dir, step0_data=None):
     if step0_data and "aligned_ply_path" in step0_data:
-        return step0_data["aligned_ply_path"]
+        rp = step0_data["aligned_ply_path"]
+        _validate_cached_alignment(ply_path, rp, step0_data)
+        return rp
     rp = os.path.join(output_dir, "aligned_map.ply")
-    return rp if os.path.exists(rp) else ply_path
+    if os.path.exists(rp):
+        _validate_cached_alignment(ply_path, rp, step0_data)
+        return rp
+    return ply_path
 
 
-def _load_gaussian_ply(ply_path, device, opacity_min=0.0, scale_mul=1.0):
+def _ply_vertex_count(path):
+    try:
+        from plyfile import PlyData
+        return int(PlyData.read(path)["vertex"].count)
+    except Exception:
+        return None
+
+
+def _validate_cached_alignment(ply_path, aligned_path, step0_data=None):
+    if not aligned_path or not os.path.exists(aligned_path):
+        return
+
+    src_meta = step0_data.get("source_ply_path") if isinstance(step0_data, dict) else None
+    if src_meta and os.path.abspath(src_meta) != os.path.abspath(ply_path):
+        raise RuntimeError(
+            "Cached step0 alignment was built from a different PLY.\n"
+            f"  current --ply_map : {os.path.abspath(ply_path)}\n"
+            f"  cached source     : {src_meta}\n"
+            "Rerun step0/step1 for this PLY or use a separate --output_dir."
+        )
+
+    src_n = _ply_vertex_count(ply_path)
+    aligned_n = _ply_vertex_count(aligned_path)
+    if (
+        src_n is not None and aligned_n is not None
+        and os.path.abspath(aligned_path) != os.path.abspath(ply_path)
+        and abs(aligned_n - src_n) > int(src_n * 0.01)
+    ):
+        print(
+            "  [Gaussian PLY] Warning: cached aligned_map.ply vertex count differs "
+            f"from --ply_map ({aligned_n:,} vs {src_n:,}). "
+            "This is OK if step0 cropped the map; otherwise use a clean --output_dir."
+        )
+    if src_n is not None and aligned_n is not None and aligned_n > int(src_n * 1.01):
+        raise RuntimeError(
+            "Cached aligned_map.ply looks stale for the requested PLY.\n"
+            f"  current --ply_map vertices : {src_n:,}\n"
+            f"  cached aligned vertices    : {aligned_n:,}\n"
+            f"  cached aligned_map         : {aligned_path}\n"
+            "Alignment/cropping cannot increase vertex count like this. "
+            "Rerun step0/step1 for this PLY or use a clean --output_dir."
+        )
+
+
+def _load_gaussian_ply(ply_path, device, opacity_min=0.0, scale_mul=1.0,
+                       scale_max=None,
+                       scale_format="log", opacity_format="logit"):
     import torch
     from plyfile import PlyData
 
@@ -468,7 +519,7 @@ def _load_gaussian_ply(ply_path, device, opacity_min=0.0, scale_mul=1.0):
         )
 
     means_np = np.stack([v["x"], v["y"], v["z"]], axis=1).astype(np.float32)
-    scales_log_np = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=1).astype(np.float32)
+    scales_raw_np = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=1).astype(np.float32)
     quats_np = np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=1).astype(np.float32)
     opacity_raw_np = np.asarray(v["opacity"], dtype=np.float32)
 
@@ -499,9 +550,12 @@ def _load_gaussian_ply(ply_path, device, opacity_min=0.0, scale_mul=1.0):
     else:
         colors_np = np.full((len(means_np), 3), 0.5, dtype=np.float32)
 
-    opacities_np = 1.0 / (1.0 + np.exp(-opacity_raw_np))
+    if str(opacity_format).lower() in ("actual", "prob", "probability", "alpha"):
+        opacities_np = np.clip(opacity_raw_np, 0.0, 1.0)
+    else:
+        opacities_np = 1.0 / (1.0 + np.exp(-opacity_raw_np))
     valid = np.isfinite(means_np).all(axis=1)
-    valid &= np.isfinite(scales_log_np).all(axis=1)
+    valid &= np.isfinite(scales_raw_np).all(axis=1)
     valid &= np.isfinite(quats_np).all(axis=1)
     valid &= np.isfinite(opacities_np)
     valid &= opacities_np > float(opacity_min)
@@ -510,15 +564,49 @@ def _load_gaussian_ply(ply_path, device, opacity_min=0.0, scale_mul=1.0):
         raise ValueError(f"렌더링할 Gaussian이 없습니다: opacity_min={opacity_min}")
 
     means_np = means_np[valid]
-    scales_log_np = scales_log_np[valid]
+    scales_raw_np = scales_raw_np[valid]
     quats_np = quats_np[valid]
     colors_np = colors_np[valid]
     opacity_raw_np = opacity_raw_np[valid]
     opacities_np = opacities_np[valid]
 
+    if str(scale_format).lower() in ("actual", "linear", "scale"):
+        scales_np = np.clip(scales_raw_np, 0.0, np.inf) * float(scale_mul)
+    else:
+        scale_log_clipped = np.clip(scales_raw_np, -20.0, 20.0)
+        if np.any(scales_raw_np != scale_log_clipped):
+            n_clip = int(np.count_nonzero(scales_raw_np != scale_log_clipped))
+            print(f"  [Gaussian PLY] scale log clipped: {n_clip:,} values outside [-20, 20]")
+        scales_np = np.exp(scale_log_clipped) * float(scale_mul)
+
+    scale_max_val = None if scale_max is None else float(scale_max)
+    if scale_max_val is not None and scale_max_val > 0.0:
+        scale_keep = np.max(scales_np, axis=1) <= scale_max_val
+        removed = int((~scale_keep).sum())
+        if removed > 0:
+            print(
+                f"  [Gaussian PLY] scale pruning: removed {removed:,}/{len(scale_keep):,} "
+                f"with max(scale) > {scale_max_val:g} m"
+            )
+            means_np = means_np[scale_keep]
+            scales_np = scales_np[scale_keep]
+            quats_np = quats_np[scale_keep]
+            colors_np = colors_np[scale_keep]
+            opacities_np = opacities_np[scale_keep]
+            if len(means_np) == 0:
+                raise ValueError(f"렌더링할 Gaussian이 없습니다: gaussian_scale_max={scale_max_val}")
+
+    finite_scales = scales_np[np.isfinite(scales_np)]
+    if finite_scales.size:
+        p = np.percentile(finite_scales, [50, 95, 99, 99.9, 100])
+        print(
+            "  [Gaussian PLY] scale meters p50/p95/p99/p99.9/max: "
+            + " / ".join(f"{x:.4g}" for x in p)
+        )
+
     return {
         "means": torch.from_numpy(means_np).to(device),
-        "scales": torch.from_numpy(np.exp(scales_log_np) * float(scale_mul)).to(device),
+        "scales": torch.from_numpy(scales_np).to(device),
         "quats": torch.from_numpy(quats_np).to(device),
         "opacities": torch.from_numpy(opacities_np).to(device),
         "colors": torch.from_numpy(colors_np).to(device),
@@ -626,14 +714,15 @@ def _render_gaussian_ply_diff(gs, viewpoints, config, output_dir, rd, device):
     fovy = _focal2fov(cam_cfg["fy"], H_out)
     tanfovx = math.tan(fovx * 0.5)
     tanfovy = math.tan(fovy * 0.5)
-    bg = torch.zeros(3, dtype=torch.float32, device=device)
-
     # nerfstudio splatfacto-style: pose convention 처리
     # nerfstudio가 export한 가우시안 PLY는 OpenGL convention (Y-up, Z-back)
     # diff_gaussian_rasterization도 OpenCV convention (Y-down, Z-forward)을 기대
     rend_cfg = config.get("rendering", {})
     pose_convention = str(rend_cfg.get("pose_convention", "opengl")).lower()
     depth_alpha_min = float(rend_cfg.get("gaussian_depth_alpha_min", 0.05))
+    bg_color = rend_cfg.get("background_color", [0.0, 0.0, 0.0])
+    prefilter_visible = bool(rend_cfg.get("gaussian_prefilter_visible", True))
+    bg = torch.tensor(bg_color, dtype=torch.float32, device=device)
     # OpenGL → OpenCV 변환 (Y, Z축 반전; X축은 동일)
     opengl_to_opencv = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
 
@@ -647,6 +736,8 @@ def _render_gaussian_ply_diff(gs, viewpoints, config, output_dir, rd, device):
     rendered = []
     print(f"  Rendering {len(viewpoints)} viewpoints with diff_gaussian_rasterization ...")
     print(f"    pose_convention={pose_convention}")
+    print(f"    background_color={bg_color}")
+    print(f"    prefilter_visible={prefilter_visible}")
     with torch.no_grad():
         for i, vp in enumerate(viewpoints):
             pose = vp["pose"].astype(np.float32)  # c2w
@@ -677,27 +768,44 @@ def _render_gaussian_ply_diff(gs, viewpoints, config, output_dir, rd, device):
                 debug=False,
             )
             rasterizer = GaussianRasterizer(raster_settings=settings)
-            means2d = torch.zeros_like(means, dtype=means.dtype, device=device)
+            if prefilter_visible and hasattr(rasterizer, "visible_filter"):
+                visible = rasterizer.visible_filter(
+                    means3D=means,
+                    scales=scales,
+                    rotations=rotations,
+                    cov3D_precomp=None,
+                ) > 0
+                if not bool(visible.any()):
+                    visible = torch.ones(means.shape[0], dtype=torch.bool, device=device)
+            else:
+                visible = slice(None)
+
+            means_v = means[visible]
+            scales_v = scales[visible]
+            rotations_v = rotations[visible]
+            opacities_v = opacities[visible]
+            colors_v = colors[visible]
+            means2d = torch.zeros_like(means_v, dtype=means_v.dtype, device=device)
 
             kwargs = {
-                "means3D": means,
+                "means3D": means_v,
                 "means2D": means2d,
-                "opacities": opacities,
-                "scales": scales,
-                "rotations": rotations,
+                "opacities": opacities_v,
+                "scales": scales_v,
+                "rotations": rotations_v,
                 "cov3D_precomp": None,
             }
-            if colors.ndim == 3:
-                rendered_rgb, _ = rasterizer(shs=colors, colors_precomp=None, **kwargs)
+            if colors_v.ndim == 3:
+                rendered_rgb, _ = rasterizer(shs=colors_v, colors_precomp=None, **kwargs)
             else:
-                rendered_rgb, _ = rasterizer(shs=None, colors_precomp=colors, **kwargs)
+                rendered_rgb, _ = rasterizer(shs=None, colors_precomp=colors_v, **kwargs)
 
-            xyz_h = torch.cat([means, torch.ones_like(means[:, :1])], dim=-1)
+            xyz_h = torch.cat([means_v, torch.ones_like(means_v[:, :1])], dim=-1)
             cam_xyz = xyz_h @ world_view
             depth_color = cam_xyz[:, 2:3].clamp(min=0.0).repeat(1, 3)
             rendered_depth3, _ = rasterizer(shs=None, colors_precomp=depth_color, **kwargs)
             rendered_alpha3, _ = rasterizer(
-                shs=None, colors_precomp=torch.ones_like(means[:, :3]), **kwargs)
+                shs=None, colors_precomp=torch.ones_like(means_v[:, :3]), **kwargs)
 
             rgb_np = (rendered_rgb.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
             depth_sum = rendered_depth3[0].cpu().numpy().astype(np.float32)
@@ -866,6 +974,127 @@ def _render_gaussian_ply_gsplat(gs, viewpoints, config, output_dir, rd, device):
     return rendered
 
 
+def _render_gaussian_ply_2dgs(gs, viewpoints, config, output_dir, rd, device):
+    import torch
+    import torch.nn.functional as F
+    from gsplat import rasterization_2dgs
+    from gsplat.cuda._wrapper import spherical_harmonics
+
+    cam_cfg = config["camera"]
+    W_out = int(cam_cfg["width"])
+    H_out = int(cam_cfg["height"])
+    rend_cfg = config.get("rendering", {})
+
+    near_plane = float(rend_cfg.get("gaussian_near_plane", cam_cfg.get("depth_min", 0.1)))
+    far_plane = float(rend_cfg.get("gaussian_far_plane", 80.0))
+    radius_clip = float(rend_cfg.get("gaussian_radius_clip", 0.0))
+    tile_size = int(rend_cfg.get("gaussian_tile_size", 16))
+    packed = bool(rend_cfg.get("gaussian_packed", True))
+    render_mode = str(rend_cfg.get("gaussian_render_mode", "RGB+ED"))
+    depth_alpha_min = float(rend_cfg.get("gaussian_depth_alpha_min", 0.05))
+    pose_convention = str(rend_cfg.get("pose_convention", "opencv")).lower()
+
+    bg_mode = rend_cfg.get("gaussian_background_mode", None)
+    bg_color = rend_cfg.get("background_color", [0.0, 0.0, 0.0])
+    backgrounds = None
+    background_random = False
+    if bg_mode is None:
+        backgrounds = None
+    elif str(bg_mode).lower() == "random":
+        # GS-SDF uses random background when bck_color=2. Keep it opt-in for repeatability.
+        background_random = True
+    elif str(bg_mode).lower() in ("color", "fixed"):
+        backgrounds = torch.tensor(bg_color, device=device).float().unsqueeze(0)
+
+    opengl_to_opencv = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+    K_render = torch.tensor([
+        [cam_cfg["fx"], 0, cam_cfg["cx"]],
+        [0, cam_cfg["fy"], cam_cfg["cy"]],
+        [0, 0, 1],
+    ], device=device).unsqueeze(0).float()
+
+    means = gs["means"].float()
+    quats = F.normalize(gs["quats"].float(), dim=-1)
+    scales = gs["scales"].float()
+    opacities = gs["opacities"].float()
+    colors = gs["colors"].float()
+    sh_degree = gs["sh_degree"]
+
+    rendered = []
+    print(f"  Rendering {len(viewpoints)} viewpoints with gsplat rasterization_2dgs ...")
+    print(
+        f"    mode={render_mode}, packed={packed}, tile_size={tile_size}, "
+        f"near/far={near_plane:g}/{far_plane:g}, radius_clip={radius_clip:g}"
+    )
+    print(f"    pose_convention={pose_convention}, sh_degree={sh_degree}")
+
+    with torch.no_grad():
+        for i, vp in enumerate(viewpoints):
+            pose = vp["pose"].astype(np.float32)  # c2w
+            c2w_opencv = pose @ opengl_to_opencv if pose_convention == "opengl" else pose
+            viewmat = torch.from_numpy(np.linalg.inv(c2w_opencv)).to(device).unsqueeze(0).float()
+
+            colors_render = colors
+            sh_degree_render = sh_degree
+            if sh_degree is not None:
+                campos = torch.from_numpy(c2w_opencv[:3, 3]).to(device).float()
+                dirs = F.normalize(means - campos.unsqueeze(0), p=2, dim=-1)
+                colors_render = torch.clamp_min(
+                    spherical_harmonics(int(sh_degree), dirs, colors) + 0.5,
+                    0.0,
+                )
+                sh_degree_render = None
+
+            bg = torch.rand((1, 3), device=device) if background_random else backgrounds
+            renders, alphas, _, _, _, _, _ = rasterization_2dgs(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors_render,
+                viewmats=viewmat,
+                Ks=K_render,
+                width=W_out,
+                height=H_out,
+                near_plane=near_plane,
+                far_plane=far_plane,
+                radius_clip=radius_clip,
+                sh_degree=sh_degree_render,
+                packed=packed,
+                tile_size=tile_size,
+                backgrounds=bg,
+                render_mode=render_mode,
+                sparse_grad=False,
+                absgrad=False,
+                distloss=False,
+            )
+
+            rgb_np = (renders[0, ..., :3].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+            depth_np = np.zeros((H_out, W_out), dtype=np.float32)
+            if renders.shape[-1] >= 4:
+                depth_np = renders[0, ..., 3].cpu().numpy().astype(np.float32)
+                alpha_np = alphas[0].detach().cpu().numpy().astype(np.float32).squeeze()
+                depth_np[alpha_np <= depth_alpha_min] = 0.0
+                depth_np[(depth_np < near_plane) | (depth_np > far_plane) | ~np.isfinite(depth_np)] = 0.0
+
+            rp_ = os.path.join(rd, "rgb", f"{vp['id']:06d}.png")
+            dp_ = os.path.join(rd, "depth", f"{vp['id']:06d}.npy")
+            dv_ = os.path.join(rd, "depth_vis", f"{vp['id']:06d}.png")
+            cv2.imwrite(rp_, cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR))
+            np.save(dp_, depth_np)
+            _save_depth_vis(depth_np, dv_, max_depth=cam_cfg.get("depth_max", far_plane))
+
+            rendered.append({
+                "id": vp["id"],
+                "pose": vp["pose"],
+                "rgb_path": rp_,
+                "depth_path": dp_,
+            })
+            if (i + 1) % 100 == 0:
+                print(f"  {i+1}/{len(viewpoints)}")
+    return rendered
+
+
 def _render_gaussian_ply(ply_path, viewpoints, config, output_dir, step0_data=None):
     import torch
 
@@ -876,14 +1105,20 @@ def _render_gaussian_ply(ply_path, viewpoints, config, output_dir, step0_data=No
     rend_cfg = config.get("rendering", {})
     opacity_min = float(rend_cfg.get("gaussian_opacity_min", 0.0))
     scale_mul = float(rend_cfg.get("gaussian_scale_mul", 1.0))
+    scale_max = rend_cfg.get("gaussian_scale_max", None)
     backend = str(rend_cfg.get("gaussian_backend", "diff")).lower()
 
     print(f"  From   : {rp}")
     print(f"  Device : {device}")
     print(f"  Backend: {backend}")
-    print(f"  Params : opacity_min={opacity_min}, scale_mul={scale_mul}")
+    print(f"  Params : opacity_min={opacity_min}, scale_mul={scale_mul}, scale_max={scale_max}")
 
-    gs = _load_gaussian_ply(rp, device, opacity_min=opacity_min, scale_mul=scale_mul)
+    gs = _load_gaussian_ply(
+        rp, device,
+        opacity_min=opacity_min,
+        scale_mul=scale_mul,
+        scale_max=scale_max,
+    )
     print(f"  Gaussians: {gs['num_valid']:,}/{gs['num_total']:,}")
     print(f"  SH degree: {gs['sh_degree'] if gs['sh_degree'] is not None else 'precomputed RGB'}")
 
@@ -904,6 +1139,8 @@ def _render_gaussian_ply(ply_path, viewpoints, config, output_dir, step0_data=No
             ) from exc
     elif backend == "gsplat":
         rendered = _render_gaussian_ply_gsplat(gs, viewpoints, config, output_dir, rd, device)
+    elif backend in ("2dgs", "gs_sdf", "gssdf", "gs-sdf"):
+        rendered = _render_gaussian_ply_2dgs(gs, viewpoints, config, output_dir, rd, device)
     else:
         raise ValueError(f"알 수 없는 gaussian_backend: {backend}")
 

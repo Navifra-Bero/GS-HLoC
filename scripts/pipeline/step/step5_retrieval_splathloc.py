@@ -43,6 +43,7 @@ from .step3_global_desc import (_extract_mixvpr_desc, _extract_mixvpr_spatial,
                                 _load_mixvpr_model,
                                 _extract_megaloc_desc, _extract_megaloc_spatial)
 from .step5_retrieval_type2 import step5_retrieval_type2
+from .multi_cam import infer_cam_id_from_path
 from .step2_scaffold_render import (
     _ensure_sgs_path,
     _load_render_context,
@@ -435,7 +436,9 @@ def step5_retrieval_splathloc(query_image_path, db, config, output_dir,
     unchanged. Currently single-cam; multi-cam fallback uses the primary cam.
     """
     import torch
-    print("\n" + "="*60 + "\nSTEP 5: SplatHLoc Adaptive C2F Retrieval\n" + "="*60)
+    print("\n" + "="*60 +
+          "\nSTEP 5: SplatHLoc adaptive retrieval (coarse + optional fine)"
+          "\n" + "="*60)
 
     fc  = config["features"]
     sh  = config.get("splathloc_retrieval", {})
@@ -1025,9 +1028,14 @@ def step5_retrieval_splathloc(query_image_path, db, config, output_dir,
                               color=color, fontsize=8, pad=8)
                 axc.axis("off")
 
+            coarse_summary = (
+                f"sim={gv_log[0]['similarity']:.3f}"
+                if gv_log and gv_log[0].get("gv_skipped")
+                else f"inliers={gv_log[0].get('n_inliers', 0) if gv_log else 0}"
+            )
             fig.suptitle(
                 f"Step 5 SplatHLoc [type2 fine]: main={main_cam}  cams={cam_rows}  "
-                f"coarse_best={gv_log[0]['n_inliers'] if gv_log else 0}  "
+                f"coarse_best={coarse_summary}  "
                 f"final_inliers={best_inliers}",
                 fontsize=12,
             )
@@ -1053,9 +1061,13 @@ def step5_retrieval_splathloc(query_image_path, db, config, output_dir,
                     ax[0][k + 1].set_title(title, color=col, fontsize=8)
                 ax[0][k + 1].axis("off")
             cam_tag = f"  ★cam={dynamic_primary}" if dynamic_primary else ""
+            coarse_summary = (
+                f"sim={gv_log[0]['similarity']:.3f}"
+                if gv_log and gv_log[0].get("gv_skipped")
+                else f"inliers={gv_log[0].get('n_inliers', 0) if gv_log else 0}"
+            )
             fig.suptitle(
-                f"Step 5 SplatHLoc: coarse_best="
-                f"{gv_log[0]['n_inliers'] if gv_log else 0}  "
+                f"Step 5 SplatHLoc: coarse_best={coarse_summary}  "
                 f"final_inliers={best_inliers}{cam_tag}  "
                 f"{'(fine retrieval used)' if fine_used else '(coarse only)'}",
                 fontsize=12)
@@ -1070,6 +1082,8 @@ def step5_retrieval_splathloc(query_image_path, db, config, output_dir,
         "cos_sims":         final_sims,
         "gt_entry":         gt_entry,
         "query_image_path": primary_path,
+        "query_cam_id":     primary_cam or infer_cam_id_from_path(
+            primary_path, config.get("multi_cam", {}).get("cam_ids")),
         "query_images":     query_images,
         "cam_top_results":  cam_top_results,         # type2 보존 (multi-cam일 때)
         "match_top_k":      match_top_k,

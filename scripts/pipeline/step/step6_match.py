@@ -536,16 +536,154 @@ def _run_single_match(matcher_type, matcher, query_rgb, ref_rgb,
         return _run_vismatch(matcher, query_rgb, ref_rgb, vismatch_max_dim)
 
 
+# ── SOLD2 line matching helper ─────────────────────────────────────────────
+
+def _load_sold2(dev):
+    """Kornia SOLD2 로드. pretrained=True는 최초 실행 시 weight cache가 필요하다."""
+    from kornia.feature import SOLD2
+
+    return SOLD2(pretrained=True, config=None).eval().to(dev)
+
+
+def _sold2_gray_tensor(rgb_img, dev, max_dim):
+    """RGB 이미지를 SOLD2용 grayscale tensor와 원본 좌표 복원 scale로 변환."""
+    import torch
+
+    gray = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    orig_h, orig_w = gray.shape
+    h, w = orig_h, orig_w
+    if max_dim and max(h, w) > max_dim:
+        s = float(max_dim) / float(max(h, w))
+        w, h = max(1, int(round(w * s))), max(1, int(round(h * s)))
+        gray = cv2.resize(gray, (w, h), interpolation=cv2.INTER_AREA)
+    sx = float(orig_w) / float(w)
+    sy = float(orig_h) / float(h)
+    t = torch.from_numpy(gray).unsqueeze(0).unsqueeze(0).to(dev)
+    return t, sx, sy
+
+
+def _run_sold2_lines(sold2, query_rgb, ref_rgb, dev, max_dim=640,
+                     min_line_len=40.0, max_matches=120):
+    """
+    SOLD2 line detection+matching.
+
+    Returns:
+        {
+          query_lines: (N,2,2) xy endpoints in original query pixels,
+          ref_lines:   (N,2,2) xy endpoints in original ref pixels,
+          n_matches:   int
+        }
+    """
+    import torch
+
+    q_t, q_sx, q_sy = _sold2_gray_tensor(query_rgb, dev, max_dim)
+    r_t, r_sx, r_sy = _sold2_gray_tensor(ref_rgb, dev, max_dim)
+
+    with torch.inference_mode():
+        q_out = sold2(q_t)
+        r_out = sold2(r_t)
+
+    q_lines_ij = q_out["line_segments"][0]
+    r_lines_ij = r_out["line_segments"][0]
+    if len(q_lines_ij) == 0 or len(r_lines_ij) == 0:
+        return {"query_lines": np.zeros((0, 2, 2), dtype=np.float32),
+                "ref_lines": np.zeros((0, 2, 2), dtype=np.float32),
+                "n_matches": 0}
+
+    with torch.inference_mode():
+        matches = sold2.match(q_lines_ij, r_lines_ij,
+                              q_out["dense_desc"][0][None],
+                              r_out["dense_desc"][0][None])
+
+    valid = matches != -1
+    if int(valid.sum()) == 0:
+        return {"query_lines": np.zeros((0, 2, 2), dtype=np.float32),
+                "ref_lines": np.zeros((0, 2, 2), dtype=np.float32),
+                "n_matches": 0}
+
+    match_idx = matches[valid]
+    q_lines = q_lines_ij[valid].detach().cpu().numpy()
+    r_lines = r_lines_ij[match_idx].detach().cpu().numpy()
+
+    # Kornia SOLD2 returns ij=(row, col). Convert to xy=(col, row).
+    q_lines = q_lines[..., ::-1].astype(np.float32)
+    r_lines = r_lines[..., ::-1].astype(np.float32)
+    q_lines *= np.array([q_sx, q_sy], dtype=np.float32)
+    r_lines *= np.array([r_sx, r_sy], dtype=np.float32)
+
+    q_len = np.linalg.norm(q_lines[:, 1] - q_lines[:, 0], axis=1)
+    r_len = np.linalg.norm(r_lines[:, 1] - r_lines[:, 0], axis=1)
+    keep = (q_len >= float(min_line_len)) & (r_len >= float(min_line_len))
+    q_lines = q_lines[keep]
+    r_lines = r_lines[keep]
+
+    if len(q_lines) > max_matches:
+        order = np.argsort(-np.minimum(q_len[keep], r_len[keep]))[:max_matches]
+        q_lines = q_lines[order]
+        r_lines = r_lines[order]
+
+    return {"query_lines": q_lines.astype(np.float32),
+            "ref_lines": r_lines.astype(np.float32),
+            "n_matches": int(len(q_lines))}
+
+
+def _draw_sold2_line_matches(query_rgb, ref_rgb, line_matches, out_path,
+                             title="SOLD2 line matches"):
+    """SOLD2 line correspondences를 side-by-side 이미지로 저장."""
+    q_lines = np.asarray(line_matches.get("query_lines", []), dtype=np.float32)
+    r_lines = np.asarray(line_matches.get("ref_lines", []), dtype=np.float32)
+    n = min(len(q_lines), len(r_lines))
+
+    h1, w1 = query_rgb.shape[:2]
+    h2, w2 = ref_rgb.shape[:2]
+    th = max(h1, h2)
+    sq = th / h1 if h1 != th else 1.0
+    sr = th / h2 if h2 != th else 1.0
+    qi = cv2.resize(query_rgb, (int(w1 * sq), th)) if sq != 1.0 else query_rgb
+    ri = cv2.resize(ref_rgb, (int(w2 * sr), th)) if sr != 1.0 else ref_rgb
+    canvas = np.concatenate([qi, ri], axis=1)
+    wq = qi.shape[1]
+
+    fig, ax = plt.subplots(1, 1, figsize=(16, 7))
+    ax.imshow(canvas)
+    ax.axis("off")
+    ax.set_title(f"{title}  n={n}", fontsize=11)
+
+    if n > 0:
+        cmap = plt.get_cmap("turbo", n)
+        for i in range(n):
+            c = cmap(i)
+            q = q_lines[i] * np.array([sq, sq], dtype=np.float32)
+            r = r_lines[i] * np.array([sr, sr], dtype=np.float32)
+            r[:, 0] += wq
+            ax.plot(q[:, 0], q[:, 1], color=c, linewidth=2.0, alpha=0.95)
+            ax.plot(r[:, 0], r[:, 1], color=c, linewidth=2.0, alpha=0.95)
+            qm = q.mean(axis=0)
+            rm = r.mean(axis=0)
+            ax.plot([qm[0], rm[0]], [qm[1], rm[1]],
+                    color=c, linewidth=0.7, alpha=0.28)
+            ax.scatter(q[:, 0], q[:, 1], color=[c], s=10, zorder=3)
+            ax.scatter(r[:, 0], r[:, 1], color=[c], s=10, zorder=3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ── step6_match ────────────────────────────────────────────────────────────
 
 def step6_match(step5_data, config, output_dir, save_images=True):
     """EfficientLoFTR or vismatch: query vs top-K candidates → best match."""
     import torch
-    from .multi_cam import load_multi_cam_config
-
-    print("\n" + "="*60 + "\nSTEP 6: Feature matching\n" + "="*60)
+    from .multi_cam import load_multi_cam_config, infer_cam_id_from_path
 
     fc               = config["features"]
+    matcher_label    = fc.get("matcher_name", "eloftr")
+    sold2_label      = " + SOLD2 lines" if bool(fc.get("sold2_enable", False)) else ""
+    print("\n" + "="*60 +
+          f"\nSTEP 6: Candidate feature matching ({matcher_label}{sold2_label})"
+          "\n" + "="*60)
+
     dev              = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     conf_thresh      = float(fc.get("match_conf_thresh", 0.2))
     eloftr_max_dim   = int(fc.get("eloftr_max_dim", 840))
@@ -559,6 +697,8 @@ def step6_match(step5_data, config, output_dir, save_images=True):
     # multi-cam 설정
     mc_enabled, mc_cam_ids, _, _cfg_primary = load_multi_cam_config(config)
     is_multi = mc_enabled and query_images is not None and len(query_images) > 1
+    query_cam_id = step5_data.get("query_cam_id") or infer_cam_id_from_path(
+        step5_data.get("query_image_path"), mc_cam_ids)
     # step5에서 avg_sim 기준으로 선택된 dynamic primary 우선 사용
     mc_primary = step5_data.get("dynamic_primary") or _cfg_primary
     cam_weights = {}
@@ -574,6 +714,8 @@ def step6_match(step5_data, config, output_dir, save_images=True):
         cam_rgbs = {}
         for cam_id, cam_path in query_images.items():
             cam_rgbs[cam_id] = cv2.cvtColor(cv2.imread(cam_path), cv2.COLOR_BGR2RGB)
+    else:
+        cam_rgbs = {}
 
     matcher, matcher_type, info_str = _load_matcher(config, dev)
     print(f"  Matcher: {info_str}")
@@ -597,7 +739,7 @@ def step6_match(step5_data, config, output_dir, save_images=True):
     best_ref_rgb  = cv2.cvtColor(cv2.imread(candidates[0]["rgb_path"]), cv2.COLOR_BGR2RGB)
     best_score    = -1.0
     best_n        = 0
-    best_cam_id   = mc_primary if is_multi else None
+    best_cam_id   = mc_primary if is_multi else query_cam_id
     all_match_counts = []
     all_scores       = []
     all_cam_scores   = []   # [{cam_id: score}, ...] 멀티캠 시각화용
@@ -772,7 +914,46 @@ def step6_match(step5_data, config, output_dir, save_images=True):
 
     matcher_name = fc.get("matcher_name", "eloftr")
 
+    line_matches = {
+        "query_lines": np.zeros((0, 2, 2), dtype=np.float32),
+        "ref_lines": np.zeros((0, 2, 2), dtype=np.float32),
+        "n_matches": 0,
+        "source": "sold2",
+        "cam_id": best_cam_id,
+    }
+    if bool(fc.get("sold2_enable", False)):
+        sold2_max_dim = int(fc.get("sold2_max_dim", 640))
+        sold2_min_len = float(fc.get("sold2_min_line_length", 40.0))
+        sold2_max_matches = int(fc.get("sold2_max_matches", 120))
+        q_line_rgb = cam_rgbs.get(best_cam_id, query_rgb) if is_multi else query_rgb
+        try:
+            print("  SOLD2: matching structural lines for pose refinement ...")
+            sold2 = _load_sold2(dev)
+            line_matches = _run_sold2_lines(
+                sold2, q_line_rgb, best_ref_rgb, dev,
+                max_dim=sold2_max_dim,
+                min_line_len=sold2_min_len,
+                max_matches=sold2_max_matches,
+            )
+            line_matches["source"] = "sold2"
+            line_matches["cam_id"] = best_cam_id
+            print(f"  SOLD2: {line_matches['n_matches']} matched lines")
+        except Exception as e:
+            print(f"  SOLD2 skipped: {e}")
+
     if save_images:
+        if bool(fc.get("sold2_enable", False)):
+            sold2_out = os.path.join(output_dir, "step6_sold2_matching.png")
+            q_line_rgb = cam_rgbs.get(best_cam_id, query_rgb) if is_multi else query_rgb
+            _draw_sold2_line_matches(
+                q_line_rgb,
+                best_ref_rgb,
+                line_matches,
+                sold2_out,
+                title=f"Step 6 SOLD2 [{matcher_name}] best=#{best_cand['id']}",
+            )
+            print("  Saved: step6_sold2_matching.png")
+
         def _draw_matches(ax, q_img, r_img, mkpts0, mkpts1, confs, title):
             h1, w1 = q_img.shape[:2]; h2, w2 = r_img.shape[:2]
             th = max(h1, h2)
@@ -913,6 +1094,7 @@ def step6_match(step5_data, config, output_dir, save_images=True):
         "cam_mkpts_q":      best_cam_mkpts0,   # {cam_id: query 2D kps}
         "cam_mkpts_r":      best_cam_mkpts1,   # {cam_id: render 2D kps}
         "cam_entries":      best_cam_entries,   # {cam_id: render db entry}
+        "line_matches":     line_matches,        # SOLD2 line matches for step7 point+line refine
         # 실제 매칭이 된 cam 목록 (step7 multi-PnP에서 사용)
         "active_cams":      [c for c in (list(cam_rgbs.keys()) if is_multi else [])
                              if best_cam_n_good.get(c, 0) > 0],

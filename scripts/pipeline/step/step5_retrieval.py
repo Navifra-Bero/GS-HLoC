@@ -8,6 +8,7 @@ from .step3_global_desc import (_extract_megaloc_desc, _extract_megaloc_spatial,
                                 _extract_mixvpr_desc, _extract_mixvpr_spatial,
                                 _extract_depth_spatial, _load_query_depth,
                                 _load_mixvpr_model)
+from .multi_cam import infer_cam_id_from_path
 
 
 def step5_retrieval(query_image_path, db, config, output_dir, save_images=True,
@@ -24,6 +25,8 @@ def step5_retrieval(query_image_path, db, config, output_dir, save_images=True,
     fc    = config["features"]
     top_k = config.get("matching", {}).get("top_k_retrieval", 10)
     dev   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    query_cam_id = infer_cam_id_from_path(
+        query_image_path, config.get("multi_cam", {}).get("cam_ids"))
 
     # multi-cam 여부
     is_multi = query_images is not None and len(query_images) > 1
@@ -429,6 +432,7 @@ def step5_retrieval(query_image_path, db, config, output_dir, save_images=True,
         "cos_sims":         cos_sims.tolist(),
         "gt_entry":         gt_entry,
         "query_image_path": query_image_path,
+        "query_cam_id":     query_cam_id,
         "query_images":     query_images,   # multi-cam: {cam_id: path} or None
         # multi-cam: 카메라별 개별 top-k 결과 → step6에서 각 cam이 자기 결과와 매칭
         "cam_top_results":  cam_top_results if is_multi else None,

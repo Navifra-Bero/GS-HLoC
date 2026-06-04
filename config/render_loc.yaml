@@ -17,8 +17,19 @@ camera:
 
 alignment:
   normal_threshold: 0.6
-  apply_pre_rotation: false
-  up_axis: "y_neg"
+  max_plane_trials: 8
+  apply_pre_rotation: true
+  up_axis: "y_neg"           # GS-SDF/omni result_gs.ply: -Y up → +Z
+  yaw_deg: 90.0              # Z-up 정렬 후 top-down 방향 보정. 반대면 -90.0
+  # 정렬(Z-up) 후 외곽 노이즈 제거. 주차장 외벽 바깥쪽 원형 포인트 제거용.
+  # gs_sdf_omni: 본체 씬 반경 ~45m, 50~70m gap, 70m+ 원형 링 → 반경 55m로 컷
+  crop:
+    enable: true
+    xy_radius: 55.0         # 이 XY 반경(중심 기준)을 넘는 포인트 제거
+    center: [0.0, 0.0]      # XY 중심. 미지정시 origin
+    # z_min: null           # 필요시 Z 범위 제한
+    # z_max: null
+    # bbox: [xmin, xmax, ymin, ymax]   # 반경 대신 박스 크롭
 
 sampling:
   use_step0_floor: true
@@ -53,6 +64,10 @@ rendering:
   gs_roll_180: true
   background_color: [0.0, 0.0, 0.0]
   gaussian_backend: diff
+  gaussian_prefilter_visible: true
+  gaussian_opacity_min: 0.0
+  gaussian_scale_mul: 0.9
+  gaussian_scale_max: 1.0
 
 features:
   superpoint_model: "models/superpoint_v1.pt"
@@ -98,6 +113,11 @@ features:
   jamma_max_dim: 640        # MegaDepth 학습 해상도 기준 (논문 기본값)
   jamma_coarse_thr: 0.2     # coarse matching threshold (논문 outdoor 기본값)
   jamma_fine_thr: 0.1       # fine matching threshold (논문 기본값)
+  # ── SOLD2 line matching (JamMa point match 이후 pose refinement용) ─────
+  sold2_enable: true
+  sold2_max_dim: 640
+  sold2_min_line_length: 40
+  sold2_max_matches: 120
 
 matching:
   superglue_model: "models/superglue_indoor.pth"
@@ -121,6 +141,14 @@ pnp:
   # ── SuperANSAC 전용 ──────────────────────────────────────────────────
   superansac_max_iterations: 1000
   superansac_confidence: 0.99
+  # ── Point + line refinement (PnP pose를 초기값으로 SOLD2 lines 사용) ───
+  line_refine: true
+  line_refine_min_lines: 3
+  line_refine_inlier_threshold: 12.0
+  line_refine_point_weight: 1.0
+  line_refine_line_weight: 0.7
+  line_refine_fscale: 5.0
+  line_refine_max_nfev: 40
 
 icp:
   enable: false

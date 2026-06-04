@@ -21,6 +21,9 @@ from .step6_match import (
     _make_gray_tensor_fn,
     _make_loftr_gray_tensor_fn,
     _make_jamma_preprocess_fn,
+    _load_sold2,
+    _run_sold2_lines,
+    _draw_sold2_line_matches,
 )
 
 
@@ -74,9 +77,13 @@ def step6_match_type2(step5_data, config, output_dir, save_images=True):
     """Match all type2 camera views for final top-5 and keep the best rank."""
     import torch
 
-    print("\n" + "="*60 + "\nSTEP 6 (type2): Multi-view feature matching\n" + "="*60)
-
     fc = config["features"]
+    matcher_label = fc.get("matcher_name", "eloftr")
+    sold2_label = " + SOLD2 lines" if bool(fc.get("sold2_enable", False)) else ""
+    print("\n" + "="*60 +
+          f"\nSTEP 6: Type-2 multi-view feature matching ({matcher_label}{sold2_label})"
+          "\n" + "="*60)
+
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     conf_thresh = float(fc.get("match_conf_thresh", 0.2))
     eloftr_max_dim = int(fc.get("eloftr_max_dim", 840))
@@ -217,7 +224,46 @@ def step6_match_type2(step5_data, config, output_dir, save_images=True):
 
     matcher_name = fc.get("matcher_name", "eloftr")
 
+    line_matches = {
+        "query_lines": np.zeros((0, 2, 2), dtype=np.float32),
+        "ref_lines": np.zeros((0, 2, 2), dtype=np.float32),
+        "n_matches": 0,
+        "source": "sold2",
+        "cam_id": best_cam_id,
+    }
+    if bool(fc.get("sold2_enable", False)):
+        try:
+            print(f"  SOLD2: matching lines for best PnP cam [{best_cam_id}] ...")
+            sold2 = _load_sold2(dev)
+            line_matches = _run_sold2_lines(
+                sold2,
+                cam_rgbs[best_cam_id],
+                best_ref_rgb,
+                dev,
+                max_dim=int(fc.get("sold2_max_dim", 640)),
+                min_line_len=float(fc.get("sold2_min_line_length", 40.0)),
+                max_matches=int(fc.get("sold2_max_matches", 120)),
+            )
+            line_matches["source"] = "sold2"
+            line_matches["cam_id"] = best_cam_id
+            print(f"  SOLD2: {line_matches['n_matches']} matched lines")
+        except Exception as e:
+            print(f"  SOLD2 skipped: {e}")
+
     if save_images:
+        if bool(fc.get("sold2_enable", False)):
+            sold2_out = os.path.join(output_dir, "step6_sold2_matching.png")
+            _draw_sold2_line_matches(
+                cam_rgbs[best_cam_id],
+                best_ref_rgb,
+                line_matches,
+                sold2_out,
+                title=(f"Step 6 type2 SOLD2 [{matcher_name}] "
+                       f"best=F{best_rank+1} #{best_cand['id']} "
+                       f"cam={best_cam_id}"),
+            )
+            print("  Saved: step6_sold2_matching.png")
+
         n_rows = len(cam_ids)
         fig, axes = plt.subplots(n_rows, 1, figsize=(16, 5.2 * n_rows),
                                  squeeze=False)
@@ -291,6 +337,7 @@ def step6_match_type2(step5_data, config, output_dir, save_images=True):
         "cam_mkpts_q":      best["cam_mkpts_q"],
         "cam_mkpts_r":      best["cam_mkpts_r"],
         "cam_entries":      best_cam_entries,
+        "line_matches":     line_matches,
         "active_cams":      active_cams,
         "mc_primary":       main_cam,
         "retrieval_type":   "type2",

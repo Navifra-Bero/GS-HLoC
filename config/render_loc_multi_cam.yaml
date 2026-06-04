@@ -10,42 +10,64 @@
 # =============================================================================
 
 camera:
-  fx: 1039.04598063
-  fy: 1041.49694151
-  cx: 937.04407689
-  cy: 560.82673816
+  fx: 1039.797316
+  fy: 1037.369131
+  cx: 959.375273
+  cy: 579.170841
   width: 1920
   height: 1200
   depth_scale: 1000.0
-  depth_min: 0.3
-  depth_max: 15.0
+  depth_min: 0.1
+  depth_max: 80.0
 
 alignment:
   normal_threshold: 0.6
+  max_plane_trials: 8
   apply_pre_rotation: true
-  up_axis: "y_neg"
+  up_axis: "z_neg" # GS-SDF/omni result_gs.ply: -Y up → +Z
+  yaw_deg: 0.0 # Z-up 정렬 후 top-down 방향 보정. 반대면 -90.0
+  # 정렬(Z-up) 후 외곽 노이즈 제거. 주차장 외벽 바깥쪽 원형 포인트 제거용.
+  # gs_sdf_omni: 본체 씬 반경 ~45m, 50~70m gap, 70m+ 원형 링 → 반경 55m로 컷
+  crop:
+    enable: true
+    xy_radius: 55.0 # 이 XY 반경(중심 기준)을 넘는 포인트 제거
+    center: [0.0, 0.0] # XY 중심. 미지정시 origin
+    # z_min: null           # 필요시 Z 범위 제한
+    # z_max: null
+    # bbox: [xmin, xmax, ymin, ymax]
 
 sampling:
   occupancy_mode: "height_slice_obstacle"
-  height_above_floor: 1.9
+  height_above_floor: 0.0
   max_floors: 1
   min_floor_gap: 2.5
   max_floor_height: 5.0
   floor_band: 0.3
-  grid_resolution: 0.05
-  path_spacing: 0.7
-  num_yaw_angles: 4
-  height_offsets_m: [0.0]
+  grid_resolution: 0.03
+  path_spacing: 1.0
+  num_yaw_angles: 8
+  height_offsets_m: [1.09]
   sample_mode: "grid"
   skel_grid_spacing_m: 0.7
-  distance_thresh_ratio: 0.35
-  slice_min_height_m: 0.50
-  slice_max_height_m: 2.50
-  slice_floor_splat_radius_m: 0.60
-  slice_floor_close_iterations: 4
-  slice_obstacle_inflate_m: 0.10
-  slice_obstacle_close_m: 0.80
-  slice_wall_close_m: 0.3
+  distance_thresh_ratio: 0.25
+  slice_min_height_m: 0.4
+  slice_max_height_m: 2.0
+  slice_floor_splat_radius_m: 0.1
+  slice_floor_close_iterations: 6
+  slice_obstacle_inflate_m: 0.2
+  slice_obstacle_min_points_per_cell: 7 # 벽이 sparse해서 5→1 (벽을 장애물로 인식)
+  slice_obstacle_min_area_m2: 0.08 # 작은 obstacle 조각/노이즈 제거. 0이면 비활성화
+  slice_obstacle_close_m: 0.2
+  slice_wall_close_m: 0.45
+  # Gaussian PLY는 center point만 보면 차량/물체가 sparse하게 보일 수 있어
+  # scale/rotation/opacity 기반 footprint를 BEV obstacle에 추가한다.
+  slice_use_gaussian_extent: true
+  slice_gaussian_sigma: 1.0
+  slice_gaussian_opacity_min: 0.08
+  slice_gaussian_radius_min_m: 0.03
+  slice_gaussian_radius_max_m: 0.35
+  slice_gaussian_z_radius_max_m: 0.5
+  slice_gaussian_height_overlap: false
   slice_margin_m: 2.0
   slice_support_erode_iterations: 0
   keep_largest_component: true
@@ -63,21 +85,31 @@ rendering:
   pose_convention: opencv
   gs_roll_180: false
   background_color: [0.0, 0.0, 0.0]
-  gaussian_backend: diff
-
+  gaussian_backend: 2dgs
+  gaussian_prefilter_visible: true
+  gaussian_near_plane: 0.1
+  gaussian_far_plane: 80.0
+  gaussian_radius_clip: 0.0
+  gaussian_tile_size: 16
+  gaussian_packed: true
+  gaussian_render_mode: "RGB+ED"
+  gaussian_background_mode: null
+  gaussian_opacity_min: 0.0
+  gaussian_scale_mul: 1.0
+  gaussian_scale_max: null
 
 splathloc_retrieval:
-  enabled: true
-  k1: 10                       # paper Table I indoor
-  k2: 40                      # under 150, over 10
+  enabled: false
+  k1: 10 # paper Table I indoor
+  k2: 40 # under 150, over 10
   k3: 5
-  perturb_angle_deg: 10.0       # a
-  perturb_dist_m: 1.0          # b
-  inlier_threshold: 40        # I (indoor); outdoor면 300
-  gv_stride: 10                # paper §A: every 10th retrieved
+  perturb_angle_deg: 10.0 # a
+  perturb_dist_m: 1.0 # b
+  inlier_threshold: 40 # I (indoor); outdoor면 300
+  gv_stride: 10 # paper §A: every 10th retrieved
   sparse_matcher: "superpoint-lightglue"
-  fine_trigger: "similarity"    # similarity: 빠름, inlier: 논문식 GV gate
-  similarity_threshold: 0.6    # top retrieval sim이 이보다 낮으면 fine view 생성
+  fine_trigger: "similarity" # similarity: 빠름, inlier: 논문식 GV gate
+  similarity_threshold: 0.4 # top retrieval sim이 이보다 낮으면 fine view 생성
   verify_virtual_with_gv: false # true면 virtual top-k에만 SuperPoint+LightGlue GV
   fine_renderer: "scaffold_gs" # scaffold_gs | fgs | auto | none
   sgs_model_path: "./scaffold_gs_result/2026-05-14_13:10:32"
@@ -111,12 +143,24 @@ features:
   jamma_max_dim: 640
   jamma_coarse_thr: 0.2
   jamma_fine_thr: 0.1
+  sold2_enable: true
+  sold2_max_dim: 640
+  sold2_min_line_length: 40
+  sold2_max_matches: 200
+
+real_train_images:
+  enabled: true
+  data_dir: "gaussian_train_data"
+  rectified_dir: "gaussian_train_data_rectified"
+  include_cams: ["cam_0", "cam_1", "cam_2", "cam_3"]
+  max_images: null
+  depth_lookup_radius_px: 2
 
 matching:
   superglue_model: "models/superglue_indoor.pth"
   match_threshold: 0.2
   retrieval_factor: 3
-  top_k_retrieval: 30      # type2: main cam이 가져올 후보 수 (sub cam 풀 = K × (num_yaw_angles-1))
+  top_k_retrieval: 30 # type2: main cam이 가져올 후보 수 (sub cam 풀 = K × (num_yaw_angles-1))
   use_gpu: true
 
 pnp:
@@ -128,16 +172,23 @@ pnp:
   pnp_confidence: 0.99
   superansac_max_iterations: 1000
   superansac_confidence: 0.99
-  multi_cam_consistency_trans_thresh: 0.3   # cam별 rig pose fusion 허용 위치 차이(m)
+  multi_cam_consistency_trans_thresh: 0.3 # cam별 rig pose fusion 허용 위치 차이(m)
   multi_cam_consistency_rot_thresh_deg: 2.0 # cam별 rig pose fusion 허용 회전 차이(deg)
-  multi_cam_joint_refine: true              # 고정 rig extrinsic 기반 multi-cam reprojection refine
-  multi_cam_pose_selection: "adaptive"      # best/fusion/joint/adaptive
-  multi_cam_pose_score: "median"            # adaptive 선택 기준: median 또는 rmse
-  multi_cam_accept_improve_ratio: 0.90      # baseline(best cam)보다 10% 이상 좋아질 때만 fusion/joint 채택
-  multi_cam_best_cam_degrade_ratio: 1.10    # best cam reprojection이 10% 이상 나빠지면 fusion/joint 거부
-  joint_reproj_fscale: 8.0                  # robust refine soft_l1 scale(px)
+  multi_cam_joint_refine: true # 고정 rig extrinsic 기반 multi-cam reprojection refine
+  multi_cam_pose_selection: "adaptive" # best/fusion/joint/adaptive
+  multi_cam_pose_score: "median" # adaptive 선택 기준: median 또는 rmse
+  multi_cam_accept_improve_ratio: 0.90 # baseline(best cam)보다 10% 이상 좋아질 때만 fusion/joint 채택
+  multi_cam_best_cam_degrade_ratio: 1.10 # best cam reprojection이 10% 이상 나빠지면 fusion/joint 거부
+  joint_reproj_fscale: 8.0 # robust refine soft_l1 scale(px)
   joint_max_nfev: 50
   joint_max_points_per_cam: 1200
+  line_refine: true # single-cam/fallback PnP에 SOLD2 line refinement 적용
+  line_refine_min_lines: 3
+  line_refine_inlier_threshold: 12.0
+  line_refine_point_weight: 1.0
+  line_refine_line_weight: 0.7
+  line_refine_fscale: 5.0
+  line_refine_max_nfev: 40
 
 icp:
   enable: false
@@ -154,13 +205,13 @@ multi_cam:
   enabled: true
   # ── Type 2: 종속 리트리벌 (main → sub) ─────────────────────────────────
   retrieval_type: "type2"
-  main_cam: "cam_3"           # full DB 리트리벌 수행
-  sub_cams: ["cam_1"]         # main 결과의 다른 yaw에서만 리트리벌. 여러 개 가능
-  position_tol: 0.05          # 같은 viewpoint 판정 허용오차 (m). pose 위치 이내면 동일 viewpoint
-  match_top_k: 5              # step6_match_type2에서 feature matching을 수행할 final 후보 수
+  main_cam: "cam_0" # full DB 리트리벌 수행
+  sub_cams: ["cam_1"] # main 결과의 다른 yaw에서만 리트리벌. 여러 개 가능
+  position_tol: 0.05 # 같은 viewpoint 판정 허용오차 (m). pose 위치 이내면 동일 viewpoint
+  match_top_k: 5 # step6_match_type2에서 feature matching을 수행할 final 후보 수
   # ── 호환용 (기존 step6/7 코드가 참조) ──────────────────────────────────
-  cam_ids: ["cam_3", "cam_1"]
-  primary_cam: "cam_3"
-  kapture_dir: "kapture_1_3/sensors"
+  cam_ids: ["cam_0", "cam_1"]
+  primary_cam: "cam_0"
+  kapture_dir: "test_data_rectified"
   primary_cam_weight: 0.6
   min_match_threshold: 10

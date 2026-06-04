@@ -291,8 +291,10 @@ def main():
             _mc_kapture_dir = os.path.join(os.getcwd(), _mc_kapture_dir)
         if os.path.exists(_mc_kapture_dir):
             _mc_records = parse_kapture_records(_mc_kapture_dir)
+            _mc_record_count = sum(
+                1 for k in _mc_records.keys() if not str(k).startswith("__"))
             print(f"  Multi-cam: cams={_mc_cam_ids}  primary={_mc_primary}  "
-                  f"records={len(_mc_records)} timestamps")
+                  f"records={_mc_record_count} timestamps")
         else:
             print(f"  WARNING: multi_cam enabled but kapture_dir not found: {_mc_kapture_dir}")
 

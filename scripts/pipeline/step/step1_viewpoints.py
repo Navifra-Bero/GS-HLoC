@@ -3,9 +3,111 @@ import numpy as np
 import open3d as o3d
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from plyfile import PlyData
 from scipy.ndimage import (binary_dilation, binary_erosion, distance_transform_edt,
                            gaussian_filter, maximum_filter, label, binary_fill_holes)
 from skimage.morphology import skeletonize
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -80.0, 80.0)))
+
+
+def _quat_wxyz_to_rotmat(q):
+    q = np.asarray(q, dtype=np.float64)
+    q = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return np.stack([
+        1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w),
+        2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+        2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y),
+    ], axis=1).reshape(-1, 3, 3)
+
+
+def _load_gaussian_occupancy_attrs(ply_path, sampling_cfg):
+    """Load Gaussian extent metadata for BEV obstacle occupancy.
+
+    Open3D only exposes Gaussian centers as points.  For 3DGS/2DGS PLYs, the
+    scale/rotation/opacity fields describe the actual occupied extent, which is
+    important when objects have sparse centers but large splats.
+    """
+    if not bool(sampling_cfg.get("slice_use_gaussian_extent", True)):
+        return None
+
+    try:
+        ply = PlyData.read(ply_path)
+        v = ply["vertex"].data
+    except Exception as exc:
+        print(f"  [Gaussian occupancy] disabled: failed to read PLY attrs ({exc})")
+        return None
+
+    names = v.dtype.names or ()
+    required = ["scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3", "opacity"]
+    if not all(n in names for n in required):
+        return None
+
+    scale_format = str(sampling_cfg.get("slice_gaussian_scale_format", "log")).lower()
+    scales_raw = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=1).astype(np.float32)
+    if scale_format in ("actual", "linear", "scale"):
+        scales = np.clip(scales_raw, 0.0, np.inf)
+    else:
+        scales = np.exp(np.clip(scales_raw, -20.0, 20.0))
+
+    opacity_format = str(sampling_cfg.get("slice_gaussian_opacity_format", "logit")).lower()
+    opacity_raw = np.asarray(v["opacity"], dtype=np.float32)
+    if opacity_format in ("actual", "prob", "probability", "alpha"):
+        opacities = np.clip(opacity_raw, 0.0, 1.0)
+    else:
+        opacities = _sigmoid(opacity_raw)
+
+    quats = np.stack([v[f"rot_{i}"] for i in range(4)], axis=1).astype(np.float32)
+    rot = _quat_wxyz_to_rotmat(quats)
+
+    # World-axis one-sigma extents of the oriented ellipsoid.
+    ext_x = np.sqrt(np.sum((rot[:, 0, :] * scales) ** 2, axis=1))
+    ext_y = np.sqrt(np.sum((rot[:, 1, :] * scales) ** 2, axis=1))
+    ext_z = np.sqrt(np.sum((rot[:, 2, :] * scales) ** 2, axis=1))
+
+    sigma = float(sampling_cfg.get("slice_gaussian_sigma", 2.0))
+    r_min = float(sampling_cfg.get("slice_gaussian_radius_min_m", 0.03))
+    r_max = float(sampling_cfg.get("slice_gaussian_radius_max_m", 0.8))
+    z_max = float(sampling_cfg.get("slice_gaussian_z_radius_max_m", r_max))
+    xy_radius = np.clip(sigma * np.maximum(ext_x, ext_y), r_min, r_max).astype(np.float32)
+    z_radius = np.clip(sigma * ext_z, 0.0, z_max).astype(np.float32)
+
+    finite = np.isfinite(xy_radius) & np.isfinite(z_radius) & np.isfinite(opacities)
+    xy_radius[~finite] = 0.0
+    z_radius[~finite] = 0.0
+    opacities[~finite] = 0.0
+
+    valid_r = xy_radius[xy_radius > 0]
+    if valid_r.size:
+        p = np.percentile(valid_r, [50, 95, 99, 100])
+        print(
+            "  [Gaussian occupancy] enabled: "
+            f"sigma={sigma:g}, opacity_min={sampling_cfg.get('slice_gaussian_opacity_min', 0.03)}, "
+            "xy_radius p50/p95/p99/max="
+            + "/".join(f"{x:.3f}m" for x in p)
+        )
+    return {
+        "xy_radius": xy_radius,
+        "z_radius": z_radius,
+        "opacity": opacities.astype(np.float32),
+    }
+
+
+def _remove_small_components(mask, min_area_px):
+    if min_area_px <= 1 or not np.any(mask):
+        return mask.astype(np.uint8)
+    cc, ncc = label(mask > 0)
+    if ncc == 0:
+        return mask.astype(np.uint8)
+    sizes = np.bincount(cc.ravel())
+    keep_labels = np.where(sizes >= int(min_area_px))[0]
+    keep_labels = keep_labels[keep_labels != 0]
+    if len(keep_labels) == 0:
+        return np.zeros_like(mask, dtype=np.uint8)
+    return np.isin(cc, keep_labels).astype(np.uint8)
 
 
 def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
@@ -131,6 +233,11 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
     sample_mode = samp.get("sample_mode", "skeleton")   # "skeleton" or "grid"
     skel_grid_spacing_m = samp.get("skel_grid_spacing_m", 0.8)
     keep_largest_component = bool(samp.get("keep_largest_component", True))
+    gaussian_occ = _load_gaussian_occupancy_attrs(ap, samp)
+    if gaussian_occ is not None and len(gaussian_occ["xy_radius"]) != len(points):
+        print("  [Gaussian occupancy] disabled: attr count differs from point count "
+              f"({len(gaussian_occ['xy_radius'])} vs {len(points)})")
+        gaussian_occ = None
     all_vp = []; debug_imgs = {}; vid = 0
 
     for fi, fz in enumerate(floors):
@@ -194,6 +301,23 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
                 mask = binary_dilation(mask, structure=st).astype(np.uint8)
             return mask
 
+        def rasterize_xy_variable_radius(xy_pts, radius_m):
+            mask = np.zeros((ih, iw), dtype=np.uint8)
+            if xy_pts is None or len(xy_pts) == 0:
+                return mask
+            px = np.clip(((xy_pts[:, 0] - xn) / gr).astype(int), 0, iw - 1)
+            py = np.clip(((xy_pts[:, 1] - yn) / gr).astype(int), 0, ih - 1)
+            radius_px = np.clip(np.ceil(radius_m / gr).astype(np.int32), 0, None)
+            for rp in np.unique(radius_px):
+                sel_r = radius_px == rp
+                base = np.zeros((ih, iw), dtype=np.uint8)
+                base[py[sel_r], px[sel_r]] = 1
+                if int(rp) > 0:
+                    st = np.ones((2 * int(rp) + 1, 2 * int(rp) + 1), dtype=np.uint8)
+                    base = binary_dilation(base, structure=st).astype(np.uint8)
+                mask |= base
+            return mask
+
         kern = np.ones((mk, mk), dtype=np.uint8)
         if occupancy_mode in ("height_slice_obstacle", "height_slice", "bev_slice"):
             # Build free-space from detected floor support, then remove the
@@ -203,6 +327,39 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
             occ = rasterize_xy(obstacle_pts, radius_m=0.0, min_count=obstacle_min_count)
             obstacle_occ = rasterize_xy(
                 obstacle_pts, radius_m=obstacle_radius_m, min_count=obstacle_min_count)
+            if gaussian_occ is not None:
+                opacity_min = float(samp.get("slice_gaussian_opacity_min", 0.03))
+                z0 = fz + slice_min_h
+                z1 = fz + slice_max_h
+                gz_radius = gaussian_occ["z_radius"]
+                if bool(samp.get("slice_gaussian_height_overlap", False)):
+                    g_height = ((points[:, 2] + gz_radius) > z0) & ((points[:, 2] - gz_radius) < z1)
+                else:
+                    g_height = (points[:, 2] > z0) & (points[:, 2] < z1)
+                gmask = (gaussian_occ["opacity"] >= opacity_min) & g_height
+                g_pts = points[gmask]
+                g_r = gaussian_occ["xy_radius"][gmask]
+                g_occ = rasterize_xy_variable_radius(g_pts, g_r)
+                obstacle_occ = ((obstacle_occ > 0) | (g_occ > 0)).astype(np.uint8)
+                occ = ((occ > 0) | (rasterize_xy(g_pts, radius_m=0.0) > 0)).astype(np.uint8)
+                if len(g_r):
+                    gp = np.percentile(g_r, [50, 95, 99, 100])
+                    print(
+                        f"    Gaussian obstacles: {len(g_r)} splats overlap slice, "
+                        "xy_radius p50/p95/p99/max="
+                        + "/".join(f"{x:.3f}m" for x in gp)
+                    )
+            min_obstacle_area_m2 = float(samp.get("slice_obstacle_min_area_m2", 0.0) or 0.0)
+            if min_obstacle_area_m2 > 0.0:
+                min_obstacle_area_px = int(np.ceil(min_obstacle_area_m2 / max(gr * gr, 1e-12)))
+                before = int(obstacle_occ.sum())
+                obstacle_occ = _remove_small_components(obstacle_occ, min_obstacle_area_px)
+                occ = _remove_small_components(occ, min_obstacle_area_px)
+                after = int(obstacle_occ.sum())
+                print(
+                    f"    Obstacle denoise: min_area={min_obstacle_area_m2:.3f}m^2 "
+                    f"({min_obstacle_area_px}px), pixels {before}->{after}"
+                )
             floor_occ = rasterize_xy(fp, radius_m=floor_radius_m)
             close_iter = int(samp.get("slice_floor_close_iterations", mi))
             floor_support = binary_dilation(
@@ -372,6 +529,13 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
     fig2.savefig(os.path.join(output_dir, "step1_viewpoints_3d.png"), dpi=150); plt.close()
     print(f"  Saved: step1_viewpoints.png, step1_viewpoints_3d.png")
 
-    data = {"viewpoints": all_vp, "floor_levels": floors, "debug_images": debug_imgs}
+    data = {
+        "viewpoints": all_vp,
+        "floor_levels": floors,
+        "debug_images": debug_imgs,
+        "source_ply_path": os.path.abspath(ply_path),
+        "aligned_ply_path": os.path.abspath(ap),
+        "aligned_vertex_count": int(len(points)),
+    }
     pickle.dump(data, open(os.path.join(output_dir, "step1_data.pkl"), "wb"))
     return all_vp

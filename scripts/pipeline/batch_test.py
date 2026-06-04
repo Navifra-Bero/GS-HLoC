@@ -72,8 +72,10 @@ def run_test_batch(test_dir, db, config, output_dir, gt_poses_path=None,
             mc_kapture_dir = os.path.join(os.getcwd(), mc_kapture_dir)
         if os.path.exists(mc_kapture_dir):
             mc_records = parse_kapture_records(mc_kapture_dir)
+            mc_record_count = sum(
+                1 for k in mc_records.keys() if not str(k).startswith("__"))
             print(f"  Multi-cam enabled: cams={mc_cam_ids}  primary={mc_primary}  "
-                  f"records={len(mc_records)} timestamps")
+                  f"records={mc_record_count} timestamps")
         else:
             print(f"  WARNING: multi_cam.enabled=true but kapture_dir not found: {mc_kapture_dir}")
 
