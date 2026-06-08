@@ -1,0 +1,88 @@
+<mxfile host="app.diagrams.net" agent="render_loc" version="24.0.0">
+  <diagram id="renderloc-web-viewer" name="RenderLoc Web Viewer">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1300" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ===== Group: ROS 2 graph ===== -->
+        <mxCell id="gA" value="ROS 2 그래프  (DDS)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="loc" value="localizer 노드 (VPS)&#10;→ /vps/current_pose&#10;(PoseStamped)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#1565C0;" vertex="1" parent="1">
+          <mxGeometry x="60" y="80" width="260" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="cam" value="camera 드라이버&#10;→ /cam0/image_raw/compressed&#10;(CompressedImage)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#1565C0;" vertex="1" parent="1">
+          <mxGeometry x="60" y="148" width="260" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Group: Offline prep ===== -->
+        <mxCell id="gO" value="오프라인 준비  (launch 시 1회)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F8E9;strokeColor=#558B2F;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="40" y="260" width="300" height="240" as="geometry" />
+        </mxCell>
+        <mxCell id="ply" value="aligned_map.ply  (3DGS, 바닥=z0 정렬)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#558B2F;" vertex="1" parent="1">
+          <mxGeometry x="60" y="300" width="260" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="t2s" value="ply_to_splat.py&#10;(--z-min/--z-max 슬라이스)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#558B2F;" vertex="1" parent="1">
+          <mxGeometry x="60" y="360" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="spf" value="gaussian_map.splat&#10;gaussian_map_topdown.splat" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#558B2F;" vertex="1" parent="1">
+          <mxGeometry x="60" y="430" width="260" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="eO1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;" edge="1" parent="1" source="ply" target="t2s"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eO2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;" edge="1" parent="1" source="t2s" target="spf"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ===== Group: Bridge ===== -->
+        <mxCell id="gB" value="web_pose_bridge.py   (ROS 2 node + HTTP server, 단일 프로세스)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#E65100;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="430" y="40" width="360" height="460" as="geometry" />
+        </mxCell>
+        <mxCell id="subs" value="구독(콜백)&#10;• pose → JSON payload&#10;• image → JPEG (jpeg는 패스스루, 그 외 cv2 재인코딩)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#E65100;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="450" y="80" width="320" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="bc" value="_Broadcaster (클라이언트 큐 + 최신 캐시)&#10;• pose 허브 (SSE)&#10;• 카메라 프레임 허브 (MJPEG)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#E65100;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="450" y="175" width="320" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="http" value="ThreadingHTTPServer 엔드포인트&#10;/ , /viewer.js, /lib/*   (정적, no-cache)&#10;/gaussian_map.splat  (+ _topdown)&#10;/events            (SSE: pose JSON)&#10;/camera.mjpg       (MJPEG)&#10;/config            (JSON: topdown/camera)&#10;/clientlog         (디버그)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#E65100;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="450" y="270" width="320" height="210" as="geometry" />
+        </mxCell>
+        <mxCell id="eB1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;" edge="1" parent="1" source="subs" target="bc"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eB2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;" edge="1" parent="1" source="bc" target="http"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ===== Group: Browser ===== -->
+        <mxCell id="gC" value="브라우저  (web/ — three.js + gaussian-splats-3d)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#6A1B9A;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="880" y="40" width="380" height="460" as="geometry" />
+        </mxCell>
+        <mxCell id="cli" value="viewer.js 클라이언트&#10;• addSplatScene('/gaussian_map.splat')&#10;• EventSource('/events')  → pose&#10;• &lt;img src='/camera.mjpg'&gt;&#10;• fetch('/config')" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#6A1B9A;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="900" y="80" width="340" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="m3d" value="메인 3D 뷰&#10;splat 맵 + 위치 마커 + 방향 화살표 + 궤적" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#6A1B9A;" vertex="1" parent="1">
+          <mxGeometry x="900" y="205" width="340" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="mini" value="navigation 미니맵 (2D canvas)&#10;궤적 + 현재 위치/방향 화살표 + 격자/N" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#6A1B9A;" vertex="1" parent="1">
+          <mxGeometry x="900" y="275" width="340" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="camp" value="camera view 패널  (&lt;img&gt; MJPEG)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#6A1B9A;" vertex="1" parent="1">
+          <mxGeometry x="900" y="345" width="340" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="hud" value="HUD: 연결 / load / pose# / topic / xyz / view(F·C·R)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#6A1B9A;" vertex="1" parent="1">
+          <mxGeometry x="900" y="400" width="340" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="eC1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1;" edge="1" parent="1" source="cli" target="m3d"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1;" edge="1" parent="1" source="cli" target="mini"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1;" edge="1" parent="1" source="cli" target="camp"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1;" edge="1" parent="1" source="cli" target="hud"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ===== Cross-group edges ===== -->
+        <mxCell id="x1" value="DDS 구독" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#1565C0;fontColor=#1565C0;" edge="1" parent="1" source="loc" target="subs"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="x2" value="DDS 구독" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#1565C0;fontColor=#1565C0;" edge="1" parent="1" source="cam" target="subs"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="x3" value="splat 파일 서빙" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#558B2F;fontColor=#558B2F;" edge="1" parent="1" source="spf" target="http"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="x4" value="HTTP · SSE · MJPEG · JSON" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#E65100;fontColor=#E65100;fontStyle=1;" edge="1" parent="1" source="http" target="cli"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- Legend -->
+        <mxCell id="lg" value="구간별 프로토콜:  ROS 토픽↔bridge = DDS(ROS_DOMAIN_ID 필요) /  bridge↔브라우저 = 순수 HTTP(ROS 무관)" style="text;html=1;align=left;verticalAlign=middle;fillColor=#FAFAFA;strokeColor=#9E9E9E;rounded=1;spacingLeft=8;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="530" width="1220" height="36" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
