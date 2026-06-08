@@ -18,4 +18,10 @@
   <depend>cv_bridge</depend>
   <depend>message_filters</depend>
   <depend>tf2_ros</depend>
+
+  <!-- Python 실시간 노드 런타임 의존성 -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs_py</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
 </package>
