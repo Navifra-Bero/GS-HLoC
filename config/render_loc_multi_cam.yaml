@@ -30,7 +30,7 @@ alignment:
   # gs_sdf_omni: 본체 씬 반경 ~45m, 50~70m gap, 70m+ 원형 링 → 반경 55m로 컷
   crop:
     enable: true
-    xy_radius: 55.0 # 이 XY 반경(중심 기준)을 넘는 포인트 제거
+    xy_radius: 50.0 # 이 XY 반경(중심 기준)을 넘는 포인트 제거
     center: [0.0, 0.0] # XY 중심. 미지정시 origin
     # z_min: null           # 필요시 Z 범위 제한
     # z_max: null
@@ -52,16 +52,20 @@ sampling:
   distance_thresh_ratio: 0.25
   slice_min_height_m: 0.4
   slice_max_height_m: 2.0
-  slice_floor_splat_radius_m: 0.1
-  slice_floor_close_iterations: 6
-  slice_obstacle_inflate_m: 0.2
+  slice_floor_splat_radius_m: 0.7
+  slice_floor_close_iterations: 12
+  # gs_sdf_omni_2 전용 보정: 왼쪽 구역 floor support가 sparse해서
+  # free-space 전 단계에서 끊기는 부분을 이번 데이터에서만 채운다.
+  manual_floor_support_fill_boxes_m:
+    - [-43.0, -32.0, -4.0, 4.0]
+  slice_obstacle_inflate_m: 0.10
   slice_obstacle_min_points_per_cell: 7 # 벽이 sparse해서 5→1 (벽을 장애물로 인식)
   slice_obstacle_min_area_m2: 0.08 # 작은 obstacle 조각/노이즈 제거. 0이면 비활성화
   slice_obstacle_close_m: 0.2
-  slice_wall_close_m: 0.45
+  slice_wall_close_m: 0.35
   # Gaussian PLY는 center point만 보면 차량/물체가 sparse하게 보일 수 있어
   # scale/rotation/opacity 기반 footprint를 BEV obstacle에 추가한다.
-  slice_use_gaussian_extent: true
+  slice_use_gaussian_extent: false
   slice_gaussian_sigma: 1.0
   slice_gaussian_opacity_min: 0.08
   slice_gaussian_radius_min_m: 0.03

@@ -191,32 +191,47 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
 
     z_vals = up_pts[:, 2]
 
-    bins = np.arange(z_vals.min()-0.1, z_vals.max()+0.1, 0.05)
-    hc, he = np.histogram(z_vals, bins=bins)
-    hs = gaussian_filter(hc.astype(float), sigma=2)
-    lm = (hs == maximum_filter(hs, size=20))
+    manual_floors = samp.get("floor_levels_m", None)
+    floor_source = str(samp.get("floor_z_source", "step0")).lower()
+    if manual_floors is not None:
+        floors = [float(z) for z in manual_floors][:max_floors]
+        print(f"  Floors: {[f'{z:.2f}' for z in floors]} "
+              "(source=floor_levels_m)")
+    elif floor_source in ("step0", "aligned_zero", "zero") and step0_data is not None:
+        # step0_align rotates the detected floor plane and shifts it to z=0.
+        # For Gaussian PLYs, re-detecting floors from center normals can select
+        # dense ceiling/upper surfaces instead of the actual floor.
+        floors = [0.0]
+        print("  Floors: ['0.00'] (source=step0 aligned floor)")
+    else:
+        bins = np.arange(z_vals.min()-0.1, z_vals.max()+0.1, 0.05)
+        hc, he = np.histogram(z_vals, bins=bins)
+        hs = gaussian_filter(hc.astype(float), sigma=2)
+        lm = (hs == maximum_filter(hs, size=20))
 
-    candidates = []
-    for i in range(len(hs)):
-        if lm[i] and hs[i] > min_fp:
-            z_center = (he[i]+he[i+1])/2
-            if z_center <= max_fh:
-                candidates.append((z_center, hs[i]))
+        candidates = []
+        for i in range(len(hs)):
+            if lm[i] and hs[i] > min_fp:
+                z_center = (he[i]+he[i+1])/2
+                if z_center <= max_fh:
+                    candidates.append((z_center, hs[i]))
 
-    candidates.sort(key=lambda x: -x[1])
+        candidates.sort(key=lambda x: -x[1])
 
-    floors = []
-    for z_c, count in candidates:
-        too_close = any(abs(z_c - ez) < min_gap for ez in floors)
-        if not too_close:
-            floors.append(z_c)
-        if len(floors) >= max_floors:
-            break
+        floors = []
+        for z_c, count in candidates:
+            too_close = any(abs(z_c - ez) < min_gap for ez in floors)
+            if not too_close:
+                floors.append(z_c)
+            if len(floors) >= max_floors:
+                break
 
-    floors.sort()
-    if not floors: floors = [np.median(z_vals)]
-    print(f"  Floors: {[f'{z:.2f}' for z in floors]} "
-          f"(max_floors={max_floors}, min_gap={min_gap}m, max_h={max_fh}m)")
+        floors.sort()
+        if not floors:
+            floors = [np.median(z_vals)]
+        print(f"  Floors: {[f'{z:.2f}' for z in floors]} "
+              f"(source=histogram, max_floors={max_floors}, "
+              f"min_gap={min_gap}m, max_h={max_fh}m)")
 
     gr = samp.get("grid_resolution", 0.05)
     ps = samp.get("path_spacing", 0.5)
@@ -367,6 +382,27 @@ def step1_viewpoints(ply_path, config, output_dir, step0_data=None):
             floor_support = binary_erosion(
                 floor_support, structure=kern, iterations=max(close_iter // 2, 1))
             floor_support = binary_fill_holes(floor_support > 0)
+            manual_fill_boxes = samp.get("manual_floor_support_fill_boxes_m", [])
+            for bi, box in enumerate(manual_fill_boxes):
+                if len(box) != 4:
+                    print(f"    [WARN] manual_floor_support_fill_boxes_m[{bi}] "
+                          f"must be [x_min, x_max, y_min, y_max]; got {box}")
+                    continue
+                x0, x1, y0, y1 = [float(v) for v in box]
+                c0 = max(0, int(np.floor((min(x0, x1) - xn) / gr)))
+                c1 = min(iw, int(np.ceil((max(x0, x1) - xn) / gr)))
+                r0 = max(0, int(np.floor((min(y0, y1) - yn) / gr)))
+                r1 = min(ih, int(np.ceil((max(y0, y1) - yn) / gr)))
+                if c0 >= c1 or r0 >= r1:
+                    print(f"    [WARN] manual floor fill box#{bi} outside grid: {box}")
+                    continue
+                before = int(floor_support[r0:r1, c0:c1].sum())
+                floor_support[r0:r1, c0:c1] = True
+                after = int(floor_support[r0:r1, c0:c1].sum())
+                print(f"    Manual floor support fill box#{bi}: "
+                      f"x=[{min(x0, x1):.2f},{max(x0, x1):.2f}], "
+                      f"y=[{min(y0, y1):.2f},{max(y0, y1):.2f}], "
+                      f"pixels {before}->{after}")
             closed = floor_support & (obstacle_occ == 0)
 
             if closed.sum() < 50 and occ.sum() > 0:
