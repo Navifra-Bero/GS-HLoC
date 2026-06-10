@@ -96,8 +96,6 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
     w_depth          = 1.0 - w_rgb
     cam_h            = int(config.get("camera", {}).get("height", 1200))
     cam_w            = int(config.get("camera", {}).get("width", 1920))
-    retrieval_factor = int(config.get("matching", {}).get("retrieval_factor", 3))
-    expand_k         = top_k * retrieval_factor
 
     global_desc_method = db.get("global_desc_method", "mixvpr")
 
@@ -137,7 +135,10 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
     n_unique_vp = len(pos_groups)
     print(f"  DB: {len(db['entries'])} entries, {n_unique_vp} unique viewpoints")
 
-    # ── Main cam 쿼리 디스크립터 + KDTree 검색 ───────────────────────────
+    # ── Main cam 쿼리 디스크립터 + main_cam DB subset 검색 ───────────────
+    # Type-2는 "main_cam 결과의 같은 rig/viewpoint에서 sub_cam을 고르는" 흐름이다.
+    # main 후보를 전체 DB에서 뽑으면 cam_0 query가 cam_1/cam_2 DB entry를 main
+    # rank로 선택할 수 있고, 그 sibling sub_cam이 엉뚱해 보인다.
     main_path = query_images[main_cam]
     if not os.path.isfile(main_path):
         raise FileNotFoundError(f"main cam image not found: {main_path}")
@@ -154,19 +155,31 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
             main_depth_desc = _extract_depth_spatial(depth_map, depth_grid, n_bins)
             print(f"  main depth loaded: {depth_path}")
 
-    actual_k = min(expand_k, len(db["entries"]))
-    dists, kdtree_idxs = db["kdtree"].query(main_gd, k=actual_k)
-    rgb_sims = 1.0 - dists ** 2 / 2.0
+    filter_main_by_cam = bool(mc.get("filter_main_by_cam", True))
+    if filter_main_by_cam:
+        main_search_idxs = np.array([
+            i for i, e in enumerate(db["entries"])
+            if e.get("cam_id") == main_cam
+        ], dtype=np.int64)
+        if len(main_search_idxs) == 0:
+            print(f"  WARNING: no DB entries for main_cam={main_cam}; "
+                  "falling back to all DB entries")
+            main_search_idxs = np.arange(len(db["entries"]), dtype=np.int64)
+    else:
+        main_search_idxs = np.arange(len(db["entries"]), dtype=np.int64)
+
+    main_descs = db["global_descs"][main_search_idxs]
+    rgb_sims = main_descs @ main_gd
     depth_descs_db = db.get("depth_descs")
     if (main_depth_desc is not None and depth_descs_db is not None
             and db.get("has_depth", True)):
-        depth_sims = depth_descs_db[kdtree_idxs] @ main_depth_desc
+        depth_sims = depth_descs_db[main_search_idxs] @ main_depth_desc
         main_sims_full = w_rgb * rgb_sims + w_depth * depth_sims
     else:
         main_sims_full = rgb_sims
 
     main_order = np.argsort(-main_sims_full)[:top_k]
-    main_top_idxs = kdtree_idxs[main_order]
+    main_top_idxs = main_search_idxs[main_order]
     main_top_sims = main_sims_full[main_order]
 
     main_top_results = [
@@ -174,6 +187,7 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
         for i, idx in enumerate(main_top_idxs)
     ]
     print(f"  [main {main_cam}] top-{top_k} retrieved  "
+          f"from {len(main_search_idxs)} entries  "
           f"top1=#{db['entries'][int(main_top_idxs[0])]['id']}  "
           f"sim={main_top_sims[0]:.4f}")
 
@@ -379,8 +393,9 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
                 ref = cv2.cvtColor(cv2.imread(cand["rgb_path"]), cv2.COLOR_BGR2RGB)
                 col = "green" if rank == 0 else "orange"
                 ax.imshow(ref)
+                cand_cam = cand.get("cam_id") or "map"
                 ax.set_title(
-                    f"R{rank+1} #{cand['id']}  sim={sim:.3f}",
+                    f"R{rank+1} {cand_cam}#{cand['id']}  sim={sim:.3f}",
                     color=col, fontsize=8, pad=8)
                 ax.axis("off")
 
@@ -454,7 +469,8 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
             col = "green" if rank == 0 else "purple"
             ax.imshow(ref)
             ax.set_title(
-                f"F{rank+1} #{cand['id']}  sum={sim:.3f}  {_final_id_label(rank)}\n"
+                f"F{rank+1} {cand.get('cam_id') or 'map'}#{cand['id']}  "
+                f"sum={sim:.3f}  {_final_id_label(rank)}\n"
                 f"src R{src_rank} ({shift})",
                 color=col, fontsize=8, pad=8)
             ax.axis("off")

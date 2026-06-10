@@ -22,6 +22,8 @@ import os
 import sys
 import threading
 import time
+import json
+from collections import deque
 
 import numpy as np
 import cv2
@@ -54,13 +56,15 @@ def _resolve_repo_root(explicit=None):
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.executors import ExternalShutdownException
 
 import message_filters
-from sensor_msgs.msg import CompressedImage, Image, CameraInfo
+from sensor_msgs.msg import CompressedImage, Image, CameraInfo, PointCloud2
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import Path
-from std_msgs.msg import Header
+from std_msgs.msg import Bool, Header, String
 import tf2_ros
 from scipy.spatial.transform import Rotation
 
@@ -80,6 +84,7 @@ class RosLocalizerNode(Node):
         self.declare_parameter("cam_info_topics",
                                ["/cam0/camera_info", "/cam1/camera_info"])
         self.declare_parameter("cam_ids", ["cam_0", "cam_1"])
+        self.declare_parameter("static_camera_infos", Parameter.Type.STRING_ARRAY)
         self.declare_parameter("main_cam", "cam_0")
         self.declare_parameter("sub_cams", ["cam_1"])
         self.declare_parameter("undistort", True)
@@ -90,6 +95,11 @@ class RosLocalizerNode(Node):
         self.declare_parameter("sync_slop", 0.05)
         self.declare_parameter("publish_tf", True)
         self.declare_parameter("temp_dir", "/tmp/ros_localizer")
+        self.declare_parameter("lidar_topic", "/hrz/points")
+        self.declare_parameter("control_topic", "/vps/localizer_enabled")
+        self.declare_parameter("status_topic", "/vps/localizer_status")
+        self.declare_parameter("start_enabled", False)
+        self.declare_parameter("status_timeout_sec", 2.0)
         # 웹 뷰어(web_pose_bridge)가 구독하는 토픽명
         self.declare_parameter("pose_topic", "/vps/current_pose")
         self.declare_parameter("path_topic", "/vps/pred_path")
@@ -98,6 +108,8 @@ class RosLocalizerNode(Node):
         self.cam_topics = list(gp("cam_topics").value)
         self.cam_info_topics = list(gp("cam_info_topics").value)
         self.cam_ids = list(gp("cam_ids").value)
+        static_infos = gp("static_camera_infos").value
+        self.static_camera_infos = list(static_infos) if static_infos else []
         self.main_cam = gp("main_cam").value
         self.sub_cams = list(gp("sub_cams").value)
         self.do_undistort = bool(gp("undistort").value)
@@ -108,6 +120,11 @@ class RosLocalizerNode(Node):
         self.sync_slop = float(gp("sync_slop").value)
         self.publish_tf = bool(gp("publish_tf").value)
         self.temp_dir = gp("temp_dir").value
+        self.lidar_topic = gp("lidar_topic").value
+        self.control_topic = gp("control_topic").value
+        self.status_topic = gp("status_topic").value
+        self.localization_enabled = bool(gp("start_enabled").value)
+        self.status_timeout_sec = float(gp("status_timeout_sec").value)
 
         if not (len(self.cam_topics) == len(self.cam_info_topics) == len(self.cam_ids)):
             raise ValueError(
@@ -166,6 +183,7 @@ class RosLocalizerNode(Node):
         # ── undistort 맵 캐시 (camera_info 수신 시 1회 빌드) ─────────────────
         self.undistort_maps = {}     # cam_id → (map1, map2)
         self.cam_K = {}              # cam_id → 3×3 (참고용)
+        self._load_static_camera_infos(self.static_camera_infos)
 
         # ── 동기 프레임 슬롯 + 워커 스레드 ─────────────────────────────────
         self._lock = threading.Lock()
@@ -173,12 +191,23 @@ class RosLocalizerNode(Node):
         self._stop = False
         self._last_proc_t = 0.0
         self._frame_seq = 0
+        self._cam_last_seen = {cid: None for cid in self.cam_ids}
+        self._cam_last_stamp = {cid: None for cid in self.cam_ids}
+        self._cam_seen_times = {cid: deque(maxlen=200) for cid in self.cam_ids}
+        self._lidar_last_seen = None
+        self._lidar_last_stamp = None
+        self._lidar_seen_times = deque(maxlen=500)
+        self._localize_done_times = deque(maxlen=100)
+        self._last_localize_sec = None
+        self._last_localize_ok = None
+        self._last_status_t = 0.0
 
         # ── publishers ─────────────────────────────────────────────────────
         pose_topic = gp("pose_topic").value
         path_topic = gp("path_topic").value
         self.pose_pub = self.create_publisher(PoseStamped, pose_topic, 10)
         self.path_pub = self.create_publisher(Path, path_topic, 10)
+        self.status_pub = self.create_publisher(String, self.status_topic, 10)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self.path_msg = Path()
         self.path_msg.header.frame_id = self.map_frame
@@ -199,15 +228,28 @@ class RosLocalizerNode(Node):
 
         # image: ApproximateTimeSynchronizer 로 동기화
         self._img_subs = []
+        self._image_status_subs = []
         for i, img_topic in enumerate(self.cam_topics):
             msg_type = (CompressedImage if img_topic.endswith("compressed")
                         else Image)
             self._img_subs.append(
                 message_filters.Subscriber(self, msg_type, img_topic,
                                            qos_profile=sensor_qos))
+            cid = self.topic_cam_id[i]
+            self._image_status_subs.append(self.create_subscription(
+                msg_type, img_topic,
+                lambda msg, c=cid: self._on_image_status(msg, c), sensor_qos))
         self._sync = message_filters.ApproximateTimeSynchronizer(
             self._img_subs, queue_size=5, slop=self.sync_slop)
         self._sync.registerCallback(self._on_synced_images)
+
+        self._lidar_sub = None
+        if self.lidar_topic:
+            self._lidar_sub = self.create_subscription(
+                PointCloud2, self.lidar_topic, self._on_lidar_status, sensor_qos)
+        self._control_sub = self.create_subscription(
+            Bool, self.control_topic, self._on_control, 10)
+        self._status_timer = self.create_timer(0.5, self._publish_status)
 
         # 워커 스레드 시작
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
@@ -217,32 +259,83 @@ class RosLocalizerNode(Node):
             "구독 토픽:\n  " + "\n  ".join(
                 f"{t}  → {self.topic_cam_id[i]}"
                 for i, t in enumerate(self.cam_topics)))
+        rate_text = "unlimited" if self.rate_hz <= 0.0 else f"{self.rate_hz}Hz"
         self.get_logger().info(
-            f"처리 상한 rate={self.rate_hz}Hz  undistort={self.do_undistort}  "
+            f"처리 상한 rate={rate_text}  undistort={self.do_undistort}  "
             f"sync_slop={self.sync_slop}s")
+        self.get_logger().info(
+            f"localizer control={self.control_topic} start_enabled={self.localization_enabled} "
+            f"status={self.status_topic} lidar={self.lidar_topic or '-'}")
 
     # ── camera_info → undistort 맵 ──────────────────────────────────────────
     def _on_camera_info(self, msg: CameraInfo, cam_id: str):
         if cam_id in self.undistort_maps:
             return
         K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        D = np.array(msg.d, dtype=np.float64).reshape(-1)[:4].reshape(4, 1)
+        size = (int(msg.width), int(msg.height))
+        self._set_camera_model(cam_id, size, K, D, msg.distortion_model or "fisheye",
+                               source="camera_info")
+
+    def _load_static_camera_infos(self, specs):
+        """CameraInfo topic이 없는 bag 테스트용 정적 intrinsic 로더.
+
+        형식:
+          cam_id MODEL width height fx fy cx cy k1 k2 k3 k4
+        구분자는 공백 또는 ':' 모두 허용한다.
+        """
+        for raw in specs:
+            if not raw:
+                continue
+            parts = str(raw).replace(":", " ").replace(",", " ").split()
+            if len(parts) != 12:
+                self.get_logger().warn(
+                    "static_camera_infos 항목 형식 오류: "
+                    f"{raw!r} (필요: cam_id model w h fx fy cx cy k1 k2 k3 k4)")
+                continue
+            cam_id, model = parts[0], parts[1]
+            try:
+                width = int(float(parts[2]))
+                height = int(float(parts[3]))
+                fx, fy, cx, cy = map(float, parts[4:8])
+                dist = np.array(list(map(float, parts[8:12])),
+                                dtype=np.float64).reshape(4, 1)
+            except ValueError as e:
+                self.get_logger().warn(
+                    f"static_camera_infos 파싱 실패: {raw!r}: {e}")
+                continue
+            K = np.array([[fx, 0.0, cx],
+                          [0.0, fy, cy],
+                          [0.0, 0.0, 1.0]], dtype=np.float64)
+            self._set_camera_model(cam_id, (width, height), K, dist, model,
+                                   source="static")
+
+    def _set_camera_model(self, cam_id, size, K, D, model, source):
         self.cam_K[cam_id] = K
         if not self.do_undistort:
             self.undistort_maps[cam_id] = None
-            self.get_logger().info(f"[{cam_id}] undistort 비활성화, K 저장만 함")
+            self.get_logger().info(
+                f"[{cam_id}] {source} K 저장 완료, undistort 비활성화")
             return
-        D = np.array(msg.d, dtype=np.float64).reshape(-1)[:4].reshape(4, 1)
-        size = (int(msg.width), int(msg.height))
+        model_l = str(model).lower()
         # keep_original_k=True → new_K = K (test_data_rectified 와 동일 규약)
-        map1, map2 = cv2.fisheye.initUndistortRectifyMap(
-            K, D, np.eye(3), K, size, cv2.CV_16SC2)
+        if "fisheye" in model_l or "equidistant" in model_l:
+            map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+                K, D, np.eye(3), K, size, cv2.CV_16SC2)
+        else:
+            map1, map2 = cv2.initUndistortRectifyMap(
+                K, D.reshape(-1), None, K, size, cv2.CV_16SC2)
         self.undistort_maps[cam_id] = (map1, map2)
         self.get_logger().info(
-            f"[{cam_id}] undistort 맵 빌드 완료  size={size}  "
+            f"[{cam_id}] {source} undistort 맵 빌드 완료  size={size}  "
             f"fx={K[0,0]:.1f} fy={K[1,1]:.1f}")
 
     # ── 동기 이미지 콜백: 최신 프레임만 슬롯에 보관 (드롭) ───────────────────
     def _on_synced_images(self, *msgs):
+        if not self.localization_enabled:
+            return
+        if not self._pose_ready_now():
+            return
         frame = {}
         for i, m in enumerate(msgs):
             cid = self.topic_cam_id[i]
@@ -252,6 +345,99 @@ class RosLocalizerNode(Node):
             frame[cid] = (bgr, m.header.stamp)
         with self._lock:
             self._latest = frame
+
+    def _on_image_status(self, msg, cam_id: str):
+        now = time.time()
+        self._cam_last_seen[cam_id] = now
+        self._cam_last_stamp[cam_id] = msg.header.stamp
+        self._cam_seen_times[cam_id].append(now)
+        self._publish_status()
+
+    def _on_lidar_status(self, msg: PointCloud2):
+        now = time.time()
+        self._lidar_last_seen = now
+        self._lidar_last_stamp = msg.header.stamp
+        self._lidar_seen_times.append(now)
+        self._publish_status()
+
+    def _on_control(self, msg: Bool):
+        self.localization_enabled = bool(msg.data)
+        if not self.localization_enabled:
+            with self._lock:
+                self._latest = None
+        self.get_logger().info(
+            "localization " + ("ENABLED" if self.localization_enabled else "DISABLED"))
+        self._publish_status(force=True)
+
+    def _is_recent(self, t):
+        return t is not None and (time.time() - t) <= self.status_timeout_sec
+
+    @staticmethod
+    def _hz_from_times(times, now, window=2.0):
+        recent = [t for t in times if now - t <= window]
+        if len(recent) < 2:
+            return 0.0
+        span = max(recent[-1] - recent[0], 1e-6)
+        return (len(recent) - 1) / span
+
+    def _pose_ready_now(self):
+        undistort_ready = (not self.do_undistort) or all(
+            cid in self.undistort_maps for cid in self.cam_ids)
+        data_ready = all(self._is_recent(self._cam_last_seen.get(cid))
+                         for cid in self.cam_ids)
+        if self.lidar_topic:
+            data_ready = data_ready and self._is_recent(self._lidar_last_seen)
+        return data_ready and undistort_ready and self.db is not None
+
+    def _publish_status(self, force=False):
+        now = time.time()
+        if not force and (now - self._last_status_t) < 0.2:
+            return
+        self._last_status_t = now
+        cams = {
+            cid: {
+                "seen": self._cam_last_seen[cid] is not None,
+                "recent": self._is_recent(self._cam_last_seen[cid]),
+                "age": None if self._cam_last_seen[cid] is None else now - self._cam_last_seen[cid],
+                "hz": self._hz_from_times(self._cam_seen_times[cid], now),
+                "topic": self.cam_topics[i],
+            }
+            for i, cid in enumerate(self.cam_ids)
+        }
+        lidar_required = bool(self.lidar_topic)
+        lidar = {
+            "required": lidar_required,
+            "seen": self._lidar_last_seen is not None,
+            "recent": (not lidar_required) or self._is_recent(self._lidar_last_seen),
+            "age": None if self._lidar_last_seen is None else now - self._lidar_last_seen,
+            "hz": self._hz_from_times(self._lidar_seen_times, now),
+            "topic": self.lidar_topic or "",
+        }
+        undistort_ready = (not self.do_undistort) or all(
+            cid in self.undistort_maps for cid in self.cam_ids)
+        data_ready = all(v["recent"] for v in cams.values()) and lidar["recent"]
+        pose_ready = data_ready and undistort_ready and self.db is not None
+        payload = {
+            "type": "localizer_status",
+            "enabled": self.localization_enabled,
+            "data_ready": data_ready,
+            "pose_ready": pose_ready,
+            "undistort_ready": undistort_ready,
+            "cams": cams,
+            "lidar": lidar,
+            "processed": self._frame_seq,
+            "localization": {
+                "enabled": self.localization_enabled,
+                "hz": self._hz_from_times(self._localize_done_times, now, window=10.0),
+                "last_sec": self._last_localize_sec,
+                "last_ok": self._last_localize_ok,
+                "rate_limit_hz": None if self.rate_hz <= 0.0 else self.rate_hz,
+                "mode": "latest_frame_drop_queue",
+            },
+        }
+        msg = String()
+        msg.data = json.dumps(payload)
+        self.status_pub.publish(msg)
 
     @staticmethod
     def _decode(msg):
@@ -267,10 +453,10 @@ class RosLocalizerNode(Node):
 
     # ── 워커: 슬롯의 최신 프레임을 rate 상한으로 처리 ───────────────────────
     def _worker_loop(self):
-        period = 1.0 / max(self.rate_hz, 1e-3)
+        period = 1.0 / self.rate_hz if self.rate_hz > 0.0 else 0.0
         while not self._stop and rclpy.ok():
             now = time.time()
-            if now - self._last_proc_t < period:
+            if period > 0.0 and now - self._last_proc_t < period:
                 time.sleep(0.005)
                 continue
             with self._lock:
@@ -323,6 +509,10 @@ class RosLocalizerNode(Node):
             save_images=False, query_images=query_images)
         dt = time.time() - t0
         self._frame_seq += 1
+        self._last_localize_sec = dt
+        self._last_localize_ok = est_pose is not None
+        self._localize_done_times.append(time.time())
+        self._publish_status(force=True)
 
         if est_pose is None:
             self.get_logger().info(f"[{self._frame_seq}] localize FAIL  ({dt:.2f}s)")
@@ -381,11 +571,12 @@ def main(args=None):
     node = RosLocalizerNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

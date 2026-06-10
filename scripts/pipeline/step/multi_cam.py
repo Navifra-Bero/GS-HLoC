@@ -11,6 +11,7 @@ COLMAP fallback:
 """
 import os
 import re
+import glob
 import numpy as np
 
 
@@ -27,6 +28,11 @@ def parse_kapture_records(kapture_dir):
         colmap_images = os.path.join(kapture_dir, "images.txt")
         if os.path.exists(colmap_images):
             return parse_colmap_records(kapture_dir)
+        # 정성평가용 데이터: pose record 파일이 없고 cam_X/images/ 디렉터리만 존재.
+        # 디렉터리를 직접 스캔해 timestamp 기반 sister 인덱스를 만든다.
+        scanned = _scan_image_dir_records(kapture_dir)
+        if scanned is not None:
+            return scanned
         raise FileNotFoundError(
             f"Neither records_camera.txt nor images.txt found under {kapture_dir}")
 
@@ -41,6 +47,56 @@ def parse_kapture_records(kapture_dir):
             ts, cam_id, rel_path = parts[0], parts[1], parts[2]
             abs_path = os.path.join(data_base, rel_path)
             records.setdefault(ts, {})[cam_id] = abs_path
+    return records
+
+
+def _scan_image_dir_records(base_dir):
+    """records 파일이 없는 정성평가용 데이터를 디렉터리 스캔으로 인덱싱한다.
+
+    구조: ``base_dir/cam_X/images/<timestamp>.<ext>`` (images/ 없으면 cam_X/ 직속도 허용)
+
+    카메라마다 timestamp가 미세하게 달라 stem이 정확히 일치하지 않을 수 있으므로,
+    COLMAP fallback과 동일하게 ``__colmap_by_cam__`` 최근접-timestamp 인덱스를 만든다.
+    동기화 허용오차는 프레임 간격 중앙값의 절반으로 추정한다.
+
+    Returns:
+        dict 또는 None (cam_X 디렉터리를 못 찾으면 None)
+    """
+    exts = {".jpg", ".jpeg", ".png", ".bmp"}
+    records = {}
+    by_cam = {}
+    for cam_dir in sorted(glob.glob(os.path.join(base_dir, "cam_*"))):
+        if not os.path.isdir(cam_dir):
+            continue
+        cam_id = os.path.basename(cam_dir)
+        img_dir = os.path.join(cam_dir, "images")
+        if not os.path.isdir(img_dir):
+            img_dir = cam_dir
+        for fname in sorted(os.listdir(img_dir)):
+            if os.path.splitext(fname)[1].lower() not in exts:
+                continue
+            stem = os.path.splitext(fname)[0]
+            path = os.path.abspath(os.path.join(img_dir, fname))
+            records.setdefault(stem, {})[cam_id] = path
+            try:
+                ts = int(stem)
+            except ValueError:
+                ts = None
+            if ts is not None:
+                by_cam.setdefault(cam_id, []).append((ts, path))
+
+    if not records:
+        return None
+
+    gaps = []
+    for cam_id in by_cam:
+        by_cam[cam_id].sort(key=lambda item: item[0])
+        ts_seq = [t for t, _ in by_cam[cam_id]]
+        gaps.extend(abs(b - a) for a, b in zip(ts_seq, ts_seq[1:]))
+    tolerance = int(np.median(gaps) * 0.5) if gaps else 200_000_000
+
+    records["__colmap_by_cam__"] = by_cam
+    records["__colmap_sync_tolerance_ns__"] = max(tolerance, 1)
     return records
 
 

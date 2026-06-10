@@ -11,8 +11,8 @@
   conda activate render_loc && source /opt/ros/humble/setup.bash && source install/setup.bash
   ros2 launch render_loc web_localizer.launch.py
   # 다른 터미널에서 이미지 재생
-  ros2 bag play /home/park/Downloads/bero_test1/bero_test1_bag --rate 0.15
-  # 브라우저: http://localhost:8080
+  ros2 bag play /home/park/Downloads/bero_test1/ch/test/test.db3
+  # 브라우저: http://localhost:8081
 """
 import os
 
@@ -26,7 +26,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     pkg_share = get_package_share_directory("render_loc")
-    default_params = os.path.join(pkg_share, "config", "ros_localizer.yaml")
+    default_params = os.path.join(pkg_share, "config", "ros_localizer_bero_cam02.yaml")
     # 소스 트리 web/ (splat 31MB 는 소스 web/ 에 둔다)
     repo_root_default = "/home/park/loc_ws/src/render_loc"
 
@@ -35,6 +35,13 @@ def generate_launch_description():
     web_dir = LaunchConfiguration("web_dir")
     aligned_ply = LaunchConfiguration("aligned_ply")
     splat_path = LaunchConfiguration("splat_path")
+    topdown_map_size = LaunchConfiguration("topdown_map_size")
+    topdown_z_min = LaunchConfiguration("topdown_z_min")
+    topdown_z_max = LaunchConfiguration("topdown_z_max")
+    trajectory_json = LaunchConfiguration("trajectory_json")
+    test_bag_path = LaunchConfiguration("test_bag_path")
+    image_topic = LaunchConfiguration("image_topic")
+    image_topic_type = LaunchConfiguration("image_topic_type")
     gen_splat = LaunchConfiguration("gen_splat")
     force_splat = LaunchConfiguration("force_splat")
     port = LaunchConfiguration("port")
@@ -45,14 +52,26 @@ def generate_launch_description():
         DeclareLaunchArgument("web_dir",
             default_value=[repo_root, "/web"]),
         DeclareLaunchArgument("aligned_ply",
-            default_value=[repo_root, "/output/gs_sdf_omni/aligned_map.ply"]),
+            default_value=[repo_root, "/output/gs_sdf_omni_2/aligned_map.ply"]),
         DeclareLaunchArgument("splat_path",
-            default_value=[repo_root, "/output/gs_sdf_omni/gaussian_map.splat"]),
+            default_value=[repo_root, "/output/gs_sdf_omni_2/gaussian_map.splat"]),
+        DeclareLaunchArgument("topdown_map_size", default_value="1024"),
+        DeclareLaunchArgument("topdown_z_min", default_value="-1.0"),
+        DeclareLaunchArgument("topdown_z_max", default_value="3.0"),
+        DeclareLaunchArgument("trajectory_json",
+            default_value="/tmp/render_loc_no_trajectory.json",
+            description="실시간 pose 모드에서는 존재하지 않는 경로로 두면 trajectory 자동탐색이 꺼짐"),
+        DeclareLaunchArgument("test_bag_path",
+            default_value="/home/park/Downloads/bero_test1/ch/test/test.db3",
+            description=", 키로 재생할 테스트 rosbag2 디렉토리 또는 .db3 파일"),
+        DeclareLaunchArgument("image_topic",
+            default_value="/cam_0/image_raw/compressed"),
+        DeclareLaunchArgument("image_topic_type", default_value="compressed"),
         DeclareLaunchArgument("gen_splat", default_value="true",
             description="splat_path 없으면 생성"),
         DeclareLaunchArgument("force_splat", default_value="false",
             description="true면 기존 splat_path가 있어도 재생성"),
-        DeclareLaunchArgument("port", default_value="8080"),
+        DeclareLaunchArgument("port", default_value="8081"),
 
         # splat 생성 (이미 있으면 건너뜀)
         ExecuteProcess(
@@ -81,7 +100,15 @@ def generate_launch_description():
             output="screen",
             parameters=[params_file, {
                 "web_dir": web_dir,
+                "aligned_ply": aligned_ply,
                 "splat_path": splat_path,
+                "topdown_map_size": topdown_map_size,
+                "topdown_z_min": topdown_z_min,
+                "topdown_z_max": topdown_z_max,
+                "trajectory_json": trajectory_json,
+                "test_bag_path": test_bag_path,
+                "image_topic": image_topic,
+                "image_topic_type": image_topic_type,
                 "port": port,
             }],
         ),
