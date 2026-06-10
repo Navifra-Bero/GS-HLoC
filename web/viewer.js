@@ -18,6 +18,7 @@ const elTopic = document.getElementById("topic");
 const elDataSub = document.getElementById("dataSub");
 const elPoseReady = document.getElementById("poseReady");
 const elLocSpeed = document.getElementById("locSpeed");
+const elPoseLag = document.getElementById("poseLag");
 const elLoad = document.getElementById("load");
 const elCam = document.getElementById("camView");
 const elCamViews = document.getElementById("camViews");
@@ -26,6 +27,45 @@ const elMiniMap = document.getElementById("miniMap");
 const elNavPanel = document.getElementById("navPanel");
 const elViewMode = document.getElementById("viewmode");
 const elHelp = document.getElementById("help");
+
+let lastCameraStampNs = null;
+
+function stampToNs(stamp) {
+  if (!stamp) return null;
+  if (typeof stamp === "number") {
+    return Number.isFinite(stamp) ? stamp * 1e9 : null;
+  }
+  const sec = Number(stamp.sec ?? 0);
+  const nsec = Number(stamp.nanosec ?? stamp.nsec ?? 0);
+  if (!Number.isFinite(sec) || !Number.isFinite(nsec)) return null;
+  return sec * 1e9 + nsec;
+}
+
+function updatePoseLagHud(msg) {
+  if (!elPoseLag) return;
+  const poseNs = stampToNs(msg.stamp);
+  if (poseNs == null) {
+    elPoseLag.textContent = "-";
+    elPoseLag.className = "warn";
+    return;
+  }
+  const nowNs = Date.now() * 1e6;
+  const ageSec = Math.max(0, (nowNs - poseNs) / 1e9);
+  const parts = [];
+  if (ageSec < 60) {
+    parts.push(`age ${ageSec.toFixed(2)}s`);
+  } else {
+    parts.push("age bag-time");
+  }
+  let lagSec = ageSec;
+  if (lastCameraStampNs != null) {
+    const camDeltaSec = (lastCameraStampNs - poseNs) / 1e9;
+    lagSec = Math.abs(camDeltaSec);
+    parts.push(`cam ${camDeltaSec >= 0 ? "+" : ""}${camDeltaSec.toFixed(2)}s`);
+  }
+  elPoseLag.textContent = parts.join(" / ");
+  elPoseLag.className = lagSec > 1.0 ? "warn" : "ok";
+}
 
 function updateViewModeHud() {
   if (!elViewMode) return;
@@ -347,6 +387,8 @@ es.onmessage = (ev) => {
     return;
   }
   if (msg.type === "camera_frame") {
+    const stampNs = Number(msg.stamp_ns);
+    lastCameraStampNs = Number.isFinite(stampNs) ? stampNs : stampToNs(msg.stamp);
     syncTrajectoryToCameraFrame(msg);
     return;
   }
@@ -359,6 +401,7 @@ es.onmessage = (ev) => {
   livePoseSeen = true;
   stopTrajectoryPlayback();
   playback.syncWithCamera = false;
+  updatePoseLagHud(msg);
   applyPoseMessage(msg, "live");
 };
 
