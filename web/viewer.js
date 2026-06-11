@@ -113,7 +113,7 @@ let localizerControlAvailable = false;
 let gridVisible = true;
 
 const FOLLOW_POSE_BACK_OFFSET_M = 0.45;
-const LOOK_FROM_POSE_BACK_OFFSET_M = 1.23;
+const LOOK_FROM_POSE_BACK_OFFSET_M = 1.3;
 const POSE_VIEW_LOOKAHEAD_M = 5.0;
 
 const playback = {
@@ -413,6 +413,7 @@ es.onmessage = (ev) => {
 };
 
 window.addEventListener("keydown", (ev) => {
+  if (ev.repeat) return;
   if (ev.code === "KeyF" || ev.key === "f" || ev.key === "F") {
     followMarker = !followMarker;
     if (followMarker) poseCamera = false;
@@ -1061,7 +1062,9 @@ async function startTestBagPlayback() {
       setLoad("bag play failed" + detail, true);
       return;
     }
-    setLoad("bag playback started");
+    setLoad(body.already_running
+      ? `bag already running (${body.pid || "-"})`
+      : `bag playback started (${body.pid || "-"})`);
     resetTrajectoryVisuals();
     if (playback.poses.length > 0) {
       playback.syncWithCamera = true;
