@@ -341,6 +341,26 @@ def parse_kapture_rigs(kapture_dir):
     return result
 
 
+def normalize_rig_transforms(rigs, config=None, direction=None):
+    """step7 내부에서 쓰는 T_rig_to_cam(T_C_R) 규약으로 rig extrinsic을 정규화.
+
+    Kapture/내부 dataset에 따라 rigs.txt의 4x4가 rig→cam일 수도,
+    cam→rig일 수도 있어서 config로 명시할 수 있게 둔다.
+    """
+    if direction is None:
+        mc = (config or {}).get("multi_cam", {}) if config is not None else {}
+        direction = mc.get("rig_transform_direction", "rig_to_cam")
+    direction = str(direction or "rig_to_cam").strip().lower()
+    if direction in ("rig_to_cam", "rig2cam", "t_rig_to_cam", "t_c_r"):
+        return rigs
+    if direction in ("cam_to_rig", "camera_to_rig", "sensor_to_rig",
+                     "cam2rig", "t_cam_to_rig", "t_r_c"):
+        return {cam_id: np.linalg.inv(T) for cam_id, T in rigs.items()}
+    raise ValueError(
+        "multi_cam.rig_transform_direction must be rig_to_cam or cam_to_rig "
+        f"(got {direction!r})")
+
+
 def _colmap_qt_to_c2w(qvec, tvec):
     from scipy.spatial.transform import Rotation
     R_cw = Rotation.from_quat([qvec[1], qvec[2], qvec[3], qvec[0]]).as_matrix()

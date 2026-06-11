@@ -9,6 +9,7 @@ highest equal-weight average feature-matching score becomes the single result
 passed to step7.
 """
 import os
+import time
 import pickle
 import numpy as np
 import cv2
@@ -83,8 +84,14 @@ def step6_match_type2(step5_data, config, output_dir, save_images=True):
     print("\n" + "="*60 +
           f"\nSTEP 6: Type-2 multi-view feature matching ({matcher_label}{sold2_label})"
           "\n" + "="*60)
+    t_step = time.perf_counter()
+    matcher_sec = 0.0
+    sold2_sec = 0.0
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def _sync_cuda():
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
     conf_thresh = float(fc.get("match_conf_thresh", 0.2))
     eloftr_max_dim = int(fc.get("eloftr_max_dim", 840))
     vismatch_max_dim = int(fc.get("vismatch_max_dim", 840))
@@ -159,6 +166,8 @@ def step6_match_type2(step5_data, config, output_dir, save_images=True):
             cam_entries[cam_id] = entry
 
             try:
+                _sync_cuda()
+                t_match = time.perf_counter()
                 mkpts0, mkpts1, confs, n_good, score = _run_single_match(
                     matcher_type, matcher, cam_rgbs[cam_id], ref_rgb,
                     conf_thresh, vismatch_max_dim,
@@ -166,7 +175,11 @@ def step6_match_type2(step5_data, config, output_dir, save_images=True):
                     jamma_preprocess_fn=jamma_preprocess_fn,
                     loftr_gray_fn=loftr_gray_fn,
                 )
+                _sync_cuda()
+                matcher_sec += time.perf_counter() - t_match
             except Exception as e:
+                _sync_cuda()
+                matcher_sec += time.perf_counter() - t_match
                 print(f"    [{cam_id}] F{rank+1} failed: {e}")
                 mkpts0 = np.zeros((0, 2))
                 mkpts1 = np.zeros((0, 2))
@@ -234,6 +247,8 @@ def step6_match_type2(step5_data, config, output_dir, save_images=True):
     if bool(fc.get("sold2_enable", False)):
         try:
             print(f"  SOLD2: matching lines for best PnP cam [{best_cam_id}] ...")
+            _sync_cuda()
+            t_sold2 = time.perf_counter()
             sold2 = _load_sold2(dev)
             line_matches = _run_sold2_lines(
                 sold2,
@@ -244,10 +259,14 @@ def step6_match_type2(step5_data, config, output_dir, save_images=True):
                 min_line_len=float(fc.get("sold2_min_line_length", 40.0)),
                 max_matches=int(fc.get("sold2_max_matches", 120)),
             )
+            _sync_cuda()
+            sold2_sec += time.perf_counter() - t_sold2
             line_matches["source"] = "sold2"
             line_matches["cam_id"] = best_cam_id
             print(f"  SOLD2: {line_matches['n_matches']} matched lines")
         except Exception as e:
+            _sync_cuda()
+            sold2_sec += time.perf_counter() - t_sold2
             print(f"  SOLD2 skipped: {e}")
 
     if save_images:
@@ -342,7 +361,14 @@ def step6_match_type2(step5_data, config, output_dir, save_images=True):
         "mc_primary":       main_cam,
         "retrieval_type":   "type2",
         "match_weights":    {c: weight for c in cam_ids},
+        "timings": {
+            "step6_matcher_sec": matcher_sec,
+            "step6_sold2_sec": sold2_sec,
+            "step6_total_internal_sec": None,
+        },
     }
+    _sync_cuda()
+    data["timings"]["step6_total_internal_sec"] = time.perf_counter() - t_step
     if save_images:
         pickle.dump(data, open(os.path.join(output_dir, "step6_data.pkl"), "wb"))
     return data

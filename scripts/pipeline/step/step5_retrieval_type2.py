@@ -14,7 +14,7 @@ Flow:
   - cam_top_results[sub_cam]  = per-rank best at same viewpoint
   - dynamic_primary = main_cam (type2는 항상 main 고정)
 """
-import os, pickle
+import os, pickle, time
 import numpy as np
 import cv2
 import matplotlib; matplotlib.use("Agg")
@@ -71,9 +71,14 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
         query_images:     {cam_id: path} 멀티캠 딕셔너리. main_cam 키 필수.
     """
     import torch
+    def _sync_cuda():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     print("\n" + "="*60 +
           "\nSTEP 5: Type-2 dependent multi-camera retrieval"
           "\n" + "="*60)
+    _sync_cuda()
+    t_step = time.perf_counter()
 
     fc    = config["features"]
     mc    = config.get("multi_cam", {})
@@ -503,7 +508,12 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
         "combined_weights": {c: combined_weight for c in active_cam_ids},
         "combined_components": combined_components,
         "combined_source_ranks": combined_source_ranks,
+        "timings": {
+            "step5_retrieval_sec": None,
+        },
     }
+    _sync_cuda()
+    data["timings"]["step5_retrieval_sec"] = time.perf_counter() - t_step
     if save_images:
         pickle.dump(data, open(os.path.join(output_dir, "step5_data.pkl"), "wb"))
     return data
