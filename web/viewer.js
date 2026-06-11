@@ -112,6 +112,10 @@ let testBagAvailable = false;
 let localizerControlAvailable = false;
 let gridVisible = true;
 
+const FOLLOW_POSE_BACK_OFFSET_M = 0.45;
+const LOOK_FROM_POSE_BACK_OFFSET_M = 1.23;
+const POSE_VIEW_LOOKAHEAD_M = 5.0;
+
 const playback = {
   poses: [],
   poseStampNs: [],
@@ -308,10 +312,13 @@ function applyPoseView(pos, q) {
   if (!viewer.camera || !viewer.controls) return;
   const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(q).normalize();
   const up = new THREE.Vector3(0, -1, 0).applyQuaternion(q).normalize();
-  const cameraPos = pos.clone().addScaledVector(forward, -0.45);
+  const backOffset = poseCamera
+    ? LOOK_FROM_POSE_BACK_OFFSET_M
+    : FOLLOW_POSE_BACK_OFFSET_M;
+  const cameraPos = pos.clone().addScaledVector(forward, -backOffset);
   viewer.camera.position.copy(cameraPos);
   viewer.camera.up.copy(up);
-  viewer.controls.target.copy(cameraPos.clone().addScaledVector(forward, 5.0));
+  viewer.controls.target.copy(cameraPos.clone().addScaledVector(forward, POSE_VIEW_LOOKAHEAD_M));
   viewer.controls.update();
 }
 
@@ -426,6 +433,8 @@ window.addEventListener("keydown", (ev) => {
     startLocalizer();
   } else if (ev.code === "BracketRight" || ev.key === "]") {
     stopLocalizer();
+  } else if (ev.code === "Comma" || ev.key === ",") {
+    toggleLocalizationDebug();
   } else {
     return;
   }
@@ -1093,15 +1102,28 @@ function stopLocalizer() {
   setLocalizerEnabled(false);
 }
 
+async function toggleLocalizationDebug() {
+  try {
+    const r = await fetch("/localizer/debug/toggle", { method: "POST" });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !body.ok) {
+      console.warn("localizer debug toggle failed:", body.error || r.statusText);
+      return;
+    }
+    setLoad(body.enabled ? "timing debug started" : "timing debug stopped");
+  } catch (e) {
+    console.warn("localizer debug toggle failed:", e);
+  }
+}
+
 function updateLocalizerStatus(msg) {
   if (elDataSub) {
     const cams = msg.cams || {};
     const names = Object.keys(cams).sort();
-    const fmtHz = (v) => Number.isFinite(Number(v)) ? `${Number(v).toFixed(1)}hz` : "0.0hz";
     const camText = names.map((name) =>
-      `${name}:${cams[name].recent ? "ok" : "wait"}(${fmtHz(cams[name].hz)})`);
+      `${name}:${cams[name].recent ? "ok" : "wait"}`);
     if (msg.lidar && msg.lidar.required) {
-      camText.push(`lidar:${msg.lidar.recent ? "ok" : "wait"}(${fmtHz(msg.lidar.hz)})`);
+      camText.push(`lidar:${msg.lidar.recent ? "ok" : "wait"}`);
     }
     elDataSub.textContent = camText.length ? camText.join(" ") : "-";
     elDataSub.className = msg.data_ready ? "ok" : (camText.length ? "warn" : "bad");
@@ -1120,13 +1142,25 @@ function updateLocalizerStatus(msg) {
   }
   if (elLocSpeed) {
     const loc = msg.localization || {};
-    const hz = Number(loc.hz);
     const sec = Number(loc.last_sec);
     const lim = Number(loc.rate_limit_hz);
+    const pnp = loc.pnp || {};
     const parts = [];
-    parts.push(Number.isFinite(hz) ? `${hz.toFixed(2)}hz` : "0.00hz");
     if (Number.isFinite(sec)) parts.push(`${sec.toFixed(2)}s`);
-    if (Number.isFinite(lim)) parts.push(`limit ${lim.toFixed(1)}hz`);
+    if (Number.isFinite(lim) && lim > 0) parts.push(`limit ${lim.toFixed(1)}hz`);
+    if (loc.debug_enabled) parts.push(`debug ${loc.debug_samples || 0}`);
+    if (pnp.best_cam) {
+      const used = Array.isArray(pnp.cams_used) && pnp.cams_used.length
+        ? ` used=${pnp.cams_used.join("+")}`
+        : "";
+      const inliers = Number.isFinite(Number(pnp.inliers))
+        ? ` inl=${Number(pnp.inliers)}`
+        : "";
+      const view = pnp.view_cam
+        ? ` view=${pnp.view_cam}${pnp.view_source ? `:${pnp.view_source}` : ""}`
+        : "";
+      parts.push(`pnp ${pnp.best_cam}${used}${inliers}${view}`);
+    }
     if (loc.last_ok === false) parts.push("last fail");
     elLocSpeed.textContent = parts.join(" / ");
     elLocSpeed.className = msg.enabled ? "ok" : "";

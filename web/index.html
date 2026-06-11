@@ -119,7 +119,7 @@ pose#: <span id="cnt">0</span>
 topic: <span id="topic">-</span>
 data sub: <span id="dataSub" class="bad">waiting</span>
 pose calc: <span id="poseReady" class="bad">not ready</span>
-loc hz: <span id="locSpeed">-</span>
+loc: <span id="locSpeed">-</span>
 pose lag: <span id="poseLag" class="warn">-</span>
 xyz: <span id="xyz">-</span>
 view: <span id="viewmode">free</span><span id="err"></span></div>
@@ -130,7 +130,8 @@ R: reset view
 G: toggle grid
 P: play bag
 [: start localization
-]: stop localization</div>
+]: stop localization
+,: toggle timing debug</div>
   <script>
     function showErr(m) {
       const e = document.getElementById("err");
