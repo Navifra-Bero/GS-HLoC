@@ -70,7 +70,7 @@
       - "/cam_2/image_raw/compressed"
     image_topic_type: "compressed"
     camera_stream_enabled: true
-    camera_stream_hz: 10.0
+    camera_stream_hz: 4.0
     localizer_control_topic: "/vps/localizer_enabled"
     localizer_debug_topic: "/vps/localizer_debug_enabled"
     localizer_status_topic: "/vps/localizer_status"

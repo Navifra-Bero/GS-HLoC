@@ -215,7 +215,7 @@ class RosLocalizerNode(Node):
 
         # ── 동기 프레임 슬롯 + 워커 스레드 ─────────────────────────────────
         self._lock = threading.Lock()
-        self._latest = None          # {cam_id: (bgr, stamp_msg)} or None
+        self._latest = None          # {cam_id: (image_msg, stamp_msg)} or None
         self._stop = False
         self._last_proc_t = 0.0
         self._frame_seq = 0
@@ -370,13 +370,10 @@ class RosLocalizerNode(Node):
             return
         if not self._pose_ready_now():
             return
-        frame = {}
-        for i, m in enumerate(msgs):
-            cid = self.topic_cam_id[i]
-            bgr = self._decode(m)
-            if bgr is None:
-                return
-            frame[cid] = (bgr, m.header.stamp)
+        frame = {
+            self.topic_cam_id[i]: (m, m.header.stamp)
+            for i, m in enumerate(msgs)
+        }
         with self._lock:
             self._latest = frame
 
@@ -612,7 +609,10 @@ class RosLocalizerNode(Node):
 
         # 각 cam undistort → temp 파일 저장 → query_images dict
         query_images = {}
-        for cid, (bgr, _stamp) in frame.items():
+        for cid, (msg, _stamp) in frame.items():
+            bgr = self._decode(msg)
+            if bgr is None:
+                return
             img = bgr
             if self.do_undistort and self.undistort_maps.get(cid) is not None:
                 map1, map2 = self.undistort_maps[cid]

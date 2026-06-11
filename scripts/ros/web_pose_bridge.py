@@ -36,6 +36,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.executors import ExternalShutdownException
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, CompressedImage
@@ -76,13 +77,14 @@ def _coerce_bool(value):
 class _Broadcaster:
     """SSE 클라이언트 큐 레지스트리 + 최신 pose 캐시."""
 
-    def __init__(self):
+    def __init__(self, queue_size=10):
         self._clients = set()
         self._lock = threading.Lock()
         self._latest = None
+        self._queue_size = int(queue_size)
 
     def register(self):
-        q = queue.Queue(maxsize=10)
+        q = queue.Queue(maxsize=max(1, self._queue_size))
         with self._lock:
             self._clients.add(q)
             latest = self._latest
@@ -96,6 +98,10 @@ class _Broadcaster:
     def unregister(self, q):
         with self._lock:
             self._clients.discard(q)
+
+    def has_clients(self):
+        with self._lock:
+            return bool(self._clients)
 
     def publish(self, payload: str):
         with self._lock:
@@ -820,6 +826,11 @@ class WebPoseBridge(Node):
                 "카메라 MJPEG 구독 비활성화(camera_stream_enabled=false)")
         img_type_param = str(self.get_parameter("image_topic_type").value).lower()
         self._cv_bridge = None
+        image_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
         for image_idx, image_topic in enumerate(image_topics):
             if not image_topic:
                 continue
@@ -827,7 +838,7 @@ class WebPoseBridge(Node):
             if img_type == "auto":
                 img_type = ("compressed" if image_topic.rstrip("/").endswith(
                     "compressed") else "raw")
-            image_bc = _Broadcaster()
+            image_bc = _Broadcaster(queue_size=1)
             if self._image_bc is None:
                 self._image_bc = image_bc
             label = image_topic.strip("/").split("/")[0] or f"camera {image_idx}"
@@ -836,7 +847,7 @@ class WebPoseBridge(Node):
                 self._subs.append(self.create_subscription(
                     CompressedImage, image_topic,
                     lambda msg, bc=image_bc: self._on_compressed_image(msg, bc),
-                    5))
+                    image_qos))
             else:
                 from cv_bridge import CvBridge
                 if self._cv_bridge is None:
@@ -844,10 +855,11 @@ class WebPoseBridge(Node):
                 self._subs.append(self.create_subscription(
                     Image, image_topic,
                     lambda msg, bc=image_bc: self._on_raw_image(msg, bc),
-                    5))
+                    image_qos))
             self.get_logger().info(
                 f"카메라 구독: {image_topic} type={img_type} "
-                f"→ MJPEG /camera_{len(self._image_bcs) - 1}.mjpg")
+                f"→ MJPEG /camera_{len(self._image_bcs) - 1}.mjpg "
+                "(best_effort depth=1)")
         if self._camera_stream_period > 0.0:
             self.get_logger().info(
                 f"카메라 MJPEG 표시 제한: {stream_hz:.1f}Hz "
@@ -961,6 +973,8 @@ class WebPoseBridge(Node):
             image_bc.publish(buf.tobytes())
 
     def _should_publish_camera_frame(self, image_bc):
+        if image_bc is None or not image_bc.has_clients():
+            return False
         if self._camera_stream_period <= 0.0:
             return True
         now = time.time()
