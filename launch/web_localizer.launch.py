@@ -42,6 +42,7 @@ def generate_launch_description():
     test_bag_path = LaunchConfiguration("test_bag_path")
     image_topic = LaunchConfiguration("image_topic")
     image_topic_type = LaunchConfiguration("image_topic_type")
+    camera_stream_enabled = LaunchConfiguration("camera_stream_enabled")
     gen_splat = LaunchConfiguration("gen_splat")
     force_splat = LaunchConfiguration("force_splat")
     port = LaunchConfiguration("port")
@@ -67,6 +68,8 @@ def generate_launch_description():
         DeclareLaunchArgument("image_topic",
             default_value="/cam_0/image_raw/compressed"),
         DeclareLaunchArgument("image_topic_type", default_value="compressed"),
+        DeclareLaunchArgument("camera_stream_enabled", default_value="true",
+            description="false면 web_pose_bridge가 image topic을 구독하지 않음"),
         DeclareLaunchArgument("gen_splat", default_value="true",
             description="splat_path 없으면 생성"),
         DeclareLaunchArgument("force_splat", default_value="false",
@@ -109,6 +112,7 @@ def generate_launch_description():
                 "test_bag_path": test_bag_path,
                 "image_topic": image_topic,
                 "image_topic_type": image_topic_type,
+                "camera_stream_enabled": camera_stream_enabled,
                 "port": port,
             }],
         ),

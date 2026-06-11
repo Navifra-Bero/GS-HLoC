@@ -52,6 +52,7 @@ def generate_launch_description():
     test_bag_path = LaunchConfiguration("test_bag_path")
     image_topic = LaunchConfiguration("image_topic")
     image_topic_type = LaunchConfiguration("image_topic_type")
+    camera_stream_enabled = LaunchConfiguration("camera_stream_enabled")
 
     return LaunchDescription([
         DeclareLaunchArgument("repo_root", default_value=repo_root_default),
@@ -91,6 +92,8 @@ def generate_launch_description():
                               description="카메라 패널용 image 토픽 (빈 값이면 비활성)"),
         DeclareLaunchArgument("image_topic_type", default_value="auto",
                               description="auto | raw | compressed"),
+        DeclareLaunchArgument("camera_stream_enabled", default_value="true",
+                              description="false면 web_pose_bridge가 image topic을 구독하지 않음"),
 
         ExecuteProcess(
             condition=IfCondition(gen_splat),
@@ -140,6 +143,7 @@ def generate_launch_description():
                 "test_bag_path": test_bag_path,
                 "image_topic": image_topic,
                 "image_topic_type": image_topic_type,
+                "camera_stream_enabled": camera_stream_enabled,
                 "port": port,
             }],
         ),

@@ -40,9 +40,12 @@
     rate_hz: 0.0
     sync_slop: 0.05
     publish_tf: true
+    publish_view_cam: "cam_0"
+    rig_transform_direction: "rig_to_cam"
     temp_dir: "/tmp/ros_localizer_bero_cam02"
     lidar_topic: "/hrz/points"
     control_topic: "/vps/localizer_enabled"
+    debug_topic: "/vps/localizer_debug_enabled"
     status_topic: "/vps/localizer_status"
     start_enabled: false
     status_timeout_sec: 2.0
@@ -66,8 +69,10 @@
       - "/cam_0/image_raw/compressed"
       - "/cam_2/image_raw/compressed"
     image_topic_type: "compressed"
-    camera_stream_hz: 4.0
+    camera_stream_enabled: true
+    camera_stream_hz: 10.0
     localizer_control_topic: "/vps/localizer_enabled"
+    localizer_debug_topic: "/vps/localizer_debug_enabled"
     localizer_status_topic: "/vps/localizer_status"
     topdown_map_size: 1024
     topdown_z_min: -1.0
