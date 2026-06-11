@@ -50,6 +50,30 @@ def _build_position_groups(entries, tol):
     return groups, entry_to_key
 
 
+def _entry_source_label(entry):
+    source = str(entry.get("source", "") or "").lower()
+    rgb_path = str(entry.get("rgb_path", "") or "").lower()
+    if source in ("real", "real_train", "train", "image", "photo"):
+        return "real"
+    if "real" in source or "real_train" in rgb_path:
+        return "real"
+    return "gaussian"
+
+
+def _is_real_entry(entry):
+    return _entry_source_label(entry) == "real"
+
+
+def _entry_cam_matches(entry, cam_id, include_camless=True):
+    entry_cam = entry.get("cam_id")
+    if entry_cam is None:
+        entry_cam = entry.get("camera_id")
+    entry_cam = str(entry_cam or "").strip()
+    if not entry_cam:
+        return bool(include_camless)
+    return entry_cam == cam_id
+
+
 def _extract_query_desc(rgb_img, method, model, dev, grid_n, use_spatial):
     """전역 디스크립터 추출 (megaloc / mixvpr 분기)."""
     if method == "megaloc":
@@ -88,11 +112,15 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
     main_cam = mc.get("main_cam") or mc.get("primary_cam")
     sub_cams = list(mc.get("sub_cams", []))
     pos_tol  = float(mc.get("position_tol", 0.05))
+    exclude_real_entries = bool(mc.get("exclude_real_entries", False))
+    include_camless_entries = bool(mc.get("include_camless_entries", True))
 
     if query_images is None or main_cam not in query_images:
         raise ValueError(f"type2 retrieval requires query_images dict with '{main_cam}' key")
 
-    print(f"  main_cam={main_cam}  sub_cams={sub_cams}  top_k={top_k}  pos_tol={pos_tol}")
+    print(f"  main_cam={main_cam}  sub_cams={sub_cams}  top_k={top_k}  "
+          f"pos_tol={pos_tol}  exclude_real={exclude_real_entries}  "
+          f"include_camless={include_camless_entries}")
 
     # ── 공통 파라미터 ──────────────────────────────────────────────────────
     use_depth        = bool(fc.get("use_depth_desc", False))
@@ -164,14 +192,24 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
     if filter_main_by_cam:
         main_search_idxs = np.array([
             i for i, e in enumerate(db["entries"])
-            if e.get("cam_id") == main_cam
+            if _entry_cam_matches(e, main_cam, include_camless_entries)
+            and (not exclude_real_entries or not _is_real_entry(e))
         ], dtype=np.int64)
         if len(main_search_idxs) == 0:
             print(f"  WARNING: no DB entries for main_cam={main_cam}; "
-                  "falling back to all DB entries")
-            main_search_idxs = np.arange(len(db["entries"]), dtype=np.int64)
+                  "falling back to all allowed DB entries")
+            main_search_idxs = np.array([
+                i for i, e in enumerate(db["entries"])
+                if not exclude_real_entries or not _is_real_entry(e)
+            ], dtype=np.int64)
     else:
-        main_search_idxs = np.arange(len(db["entries"]), dtype=np.int64)
+        main_search_idxs = np.array([
+            i for i, e in enumerate(db["entries"])
+            if not exclude_real_entries or not _is_real_entry(e)
+        ], dtype=np.int64)
+    if len(main_search_idxs) == 0:
+        raise RuntimeError("type2 retrieval 후보가 없습니다 "
+                           f"(exclude_real_entries={exclude_real_entries})")
 
     main_descs = db["global_descs"][main_search_idxs]
     rgb_sims = main_descs @ main_gd
@@ -202,7 +240,11 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
     for idx in main_top_idxs:
         idx = int(idx)
         key = entry_to_key[idx]
-        siblings = [j for j in pos_groups.get(key, []) if j != idx]
+        siblings = [
+            j for j in pos_groups.get(key, [])
+            if j != idx
+            and (not exclude_real_entries or not _is_real_entry(db["entries"][j]))
+        ]
         sub_pool_per_rank.append(siblings)
         pool_total.update(siblings)
     print(f"  Sub pool: {len(pool_total)} unique entries "
@@ -241,7 +283,8 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
                 continue
             cam_filtered = [
                 j for j in siblings
-                if db["entries"][j].get("cam_id") in (None, sub_cam)
+                if _entry_cam_matches(db["entries"][j], sub_cam,
+                                      include_camless_entries)
             ]
             if cam_filtered:
                 siblings = cam_filtered
@@ -316,6 +359,9 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
 
     candidates = [e for e, _ in main_top_results]
     cos_sims   = list(combined_sims)
+    combined_source_labels = [
+        _entry_source_label(e) for e in candidates[:len(combined_sims)]
+    ]
     match_top_k = min(int(mc.get("match_top_k", 5)), len(candidates))
     match_candidates = candidates[:match_top_k]
     match_cos_sims = cos_sims[:match_top_k]
@@ -335,7 +381,7 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
         return "same"
 
     cam_col_w = 30
-    final_col_w = 42
+    final_col_w = 52
     col_widths = [cam_col_w] * len(cam_list_ordered) + [final_col_w]
     sep   = " | "
     hdr = [
@@ -358,9 +404,10 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
         if r < len(candidates):
             source_rank = combined_source_ranks[r]
             shift = _rank_shift_label(source_rank, r + 1)
+            src_label = _entry_source_label(candidates[r])
             final_cell = (
                 f"F{r+1} #{candidates[r]['id']:<4} "
-                f"sum={combined_sims[r]:.3f} (R{source_rank}, {shift})"
+                f"sum={combined_sims[r]:.3f} (R{source_rank}, {shift}, {src_label})"
             )
             cells.append(final_cell[:final_col_w].ljust(final_col_w))
         else:
@@ -468,6 +515,7 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
             sim = combined_sims[rank]
             src_rank = combined_source_ranks[rank]
             shift = _rank_shift_label(src_rank, rank + 1)
+            src_label = _entry_source_label(cand)
             ref = _make_final_montage(rank)
             if ref is None:
                 ax.axis("off"); continue
@@ -476,7 +524,7 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
             ax.set_title(
                 f"F{rank+1} {cand.get('cam_id') or 'map'}#{cand['id']}  "
                 f"sum={sim:.3f}  {_final_id_label(rank)}\n"
-                f"src R{src_rank} ({shift})",
+                f"src R{src_rank} ({shift}, {src_label})",
                 color=col, fontsize=8, pad=8)
             ax.axis("off")
 
@@ -508,6 +556,7 @@ def step5_retrieval_type2(query_image_path, db, config, output_dir,
         "combined_weights": {c: combined_weight for c in active_cam_ids},
         "combined_components": combined_components,
         "combined_source_ranks": combined_source_ranks,
+        "combined_source_labels": combined_source_labels,
         "timings": {
             "step5_retrieval_sec": None,
         },
