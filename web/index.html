@@ -21,6 +21,7 @@
     }
     #hud .ok { color: #4ade80; }
     #hud .bad { color: #f87171; }
+    #hud .warn { color: #fbbf24; }
 
     /* 상단 패널 2개: 미니맵(네비) + 카메라 시점 */
     #panels {
@@ -28,17 +29,53 @@
       display: flex; gap: 10px; align-items: flex-start;
     }
     .panel {
+      position: relative;
       background: rgba(0,0,0,.6); border: 1px solid rgba(255,255,255,.18);
       border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.5);
+      width: 240px; height: 260px; min-width: 150px; min-height: 44px;
     }
+    #camPanel { width: 520px; height: 260px; }
     .panel .cap {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
       font: 11px/1.6 ui-monospace, Menlo, Consolas, monospace;
       color: #ccc; padding: 2px 8px; background: rgba(255,255,255,.06);
+      height: 20px; box-sizing: border-box; user-select: none;
     }
-    #miniMap { display: block; width: 240px; height: 240px; background: #0c0f14; }
-    #camView {
-      display: block; width: 320px; height: 240px; object-fit: contain;
+    .panel-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .panel-toggle {
+      width: 18px; height: 18px; border: 0; border-radius: 4px;
+      background: rgba(255,255,255,.08); color: #ddd;
+      font: 13px/18px ui-monospace, Menlo, Consolas, monospace;
+      padding: 0; cursor: pointer;
+    }
+    .panel-toggle:hover { background: rgba(255,255,255,.18); }
+    .panel-body {
+      width: 100%; height: calc(100% - 20px);
+    }
+    .panel.collapsed {
+      height: 24px !important; min-height: 24px;
+    }
+    .panel.collapsed .panel-body,
+    .panel.collapsed .resize-handle { display: none; }
+    .resize-handle {
+      position: absolute; left: 0; bottom: 0; width: 14px; height: 14px;
+      cursor: nesw-resize; z-index: 2;
+      background: linear-gradient(135deg,
+        transparent 0 45%, rgba(255,255,255,.35) 46% 55%, transparent 56% 100%);
+    }
+    #miniMap {
+      display: block; width: 100%; height: 100%; background: #0c0f14;
+      cursor: grab; touch-action: none;
+    }
+    #miniMap.dragging { cursor: grabbing; }
+    #camViews {
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      width: 100%; height: 100%; gap: 1px; background: rgba(255,255,255,.08);
+    }
+    #camView, .camView {
+      display: block; width: 100%; height: 100%; object-fit: contain;
       background: #000;
+      min-width: 0;
     }
     #camPanel.empty { display: none; }   /* 카메라 토픽 없으면 숨김 */
   </style>
@@ -52,12 +89,26 @@
 
   <div id="panels">
     <div class="panel" id="navPanel">
-      <div class="cap">navigation</div>
-      <canvas id="miniMap" width="240" height="240"></canvas>
+      <div class="cap">
+        <span class="panel-title">navigation</span>
+        <button class="panel-toggle" type="button" aria-label="toggle navigation panel">−</button>
+      </div>
+      <div class="panel-body">
+        <canvas id="miniMap" width="240" height="240"></canvas>
+      </div>
+      <div class="resize-handle" aria-hidden="true"></div>
     </div>
     <div class="panel empty" id="camPanel">
-      <div class="cap">camera view</div>
-      <img id="camView" alt="camera view" />
+      <div class="cap">
+        <span class="panel-title">camera view</span>
+        <button class="panel-toggle" type="button" aria-label="toggle camera panel">−</button>
+      </div>
+      <div class="panel-body">
+        <div id="camViews">
+          <img id="camView" class="camView" alt="camera view 0" />
+        </div>
+      </div>
+      <div class="resize-handle" aria-hidden="true"></div>
     </div>
   </div>
 
@@ -66,12 +117,21 @@
 load: <span id="load">HTML loaded</span>
 pose#: <span id="cnt">0</span>
 topic: <span id="topic">-</span>
+data sub: <span id="dataSub" class="bad">waiting</span>
+pose calc: <span id="poseReady" class="bad">not ready</span>
+loc: <span id="locSpeed">-</span>
+pose lag: <span id="poseLag" class="warn">-</span>
 xyz: <span id="xyz">-</span>
 view: <span id="viewmode">free</span><span id="err"></span></div>
   <div id="help">Mouse: orbit / pan / zoom
-F: follow marker
+F: follow pose
 C: look from pose
-R: reset view</div>
+R: reset view
+G: toggle grid
+P: play bag
+[: start localization
+]: stop localization
+,: toggle timing debug</div>
   <script>
     function showErr(m) {
       const e = document.getElementById("err");

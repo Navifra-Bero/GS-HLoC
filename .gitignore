@@ -1,6 +1,9 @@
 # ── 데이터 / 결과 / 대용량 파일 ──────────────────────────────────
 output/
 test_data/
+test_data_rectified/
+gaussian_train_data/
+gaussian_train_data_rectified/
 models/
 
 # ── ROS2 빌드 산출물 ─────────────────────────────────────────────
@@ -54,3 +57,5 @@ wandb/
 # --- 외부 라이브러리 폴더 (직접 추적하지 않을 경우) ---
 nerfstudio/
 third_party/
+# generated gaussian splat for web viewer
+web/gaussian_map.splat

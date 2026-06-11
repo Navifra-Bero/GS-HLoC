@@ -1,4 +1,4 @@
-import os, re, pickle, json
+import os, re, pickle, json, time
 import numpy as np
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -12,8 +12,17 @@ from .step.step7_pnp import step7_pnp
 from .step.multi_cam import load_multi_cam_config, parse_kapture_records, find_sister_images
 
 
+def _sync_cuda_if_available():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
 def localize_single(query_image_path, db, config, work_dir, save_images=True,
-                    query_images=None):
+                    query_images=None, return_result=False):
     """단일 쿼리 이미지에 대해 step5→step7 파이프라인 실행.
 
     Args:
@@ -29,11 +38,31 @@ def localize_single(query_image_path, db, config, work_dir, save_images=True,
         step5_fn = step5_retrieval_type2 if retrieval_type == "type2" else step5_retrieval
     step6_fn = step6_match_type2 if retrieval_type == "type2" else step6_match
     try:
+        timings = {}
+        _sync_cuda_if_available()
+        t0 = time.perf_counter()
         s5 = step5_fn(query_image_path, db, config, work_dir,
                       save_images=save_images,
                       query_images=query_images)
+        _sync_cuda_if_available()
+        timings["step5_total_sec"] = time.perf_counter() - t0
+        timings.update((s5 or {}).get("timings", {}))
+        _sync_cuda_if_available()
+        t0 = time.perf_counter()
         s6 = step6_fn(s5, config, work_dir, save_images=save_images)
+        _sync_cuda_if_available()
+        timings["step6_total_sec"] = time.perf_counter() - t0
+        timings.update((s6 or {}).get("timings", {}))
+        _sync_cuda_if_available()
+        t0 = time.perf_counter()
         result = step7_pnp(s6, s5, config, work_dir, save_images=save_images)
+        _sync_cuda_if_available()
+        timings["step7_total_sec"] = time.perf_counter() - t0
+        timings.update((result or {}).get("timings", {}))
+        if result is not None:
+            result["timings"] = timings
+        if return_result:
+            return result
         return result.get("estimated_pose") if result else None
     except Exception as e:
         print(f"    localize_single error: {e}")

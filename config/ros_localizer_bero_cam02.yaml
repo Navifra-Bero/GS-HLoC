@@ -1,0 +1,88 @@
+# =============================================================================
+# Bero test bag 실시간 localization + web viewer 설정
+#
+# Bag:
+#   /home/park/Downloads/bero_test1/ch/test/test.db3
+# Topics:
+#   /cam_0/image_raw/compressed
+#   /cam_2/image_raw/compressed
+#
+# 이 bag에는 CameraInfo가 없으므로 static_camera_infos로 fisheye intrinsic을
+# 직접 넣어서 undistort map을 시작 시점에 만든다.
+# =============================================================================
+/ros_localizer:
+  ros__parameters:
+    repo_root: ""
+    config_file: "config/render_loc_multi_cam.yaml"
+    output_dir: "output/gs_sdf_omni_2"
+
+    cam_topics:
+      - "/cam_0/image_raw/compressed"
+      - "/cam_2/image_raw/compressed"
+    cam_info_topics:
+      - "/cam_0/camera_info"
+      - "/cam_2/camera_info"
+    cam_ids:
+      - "cam_0"
+      - "cam_2"
+    main_cam: "cam_0"
+    sub_cams:
+      - "cam_2"
+
+    static_camera_infos:
+      - "cam_0 OPENCV_FISHEYE 1920 1200 1039.797316235333 1037.3691310333402 959.375272933788 579.1708409683688 -0.04266659069675333 0.005490223906292174 -0.005621265496944452 0.0013683576989255276"
+      - "cam_2 OPENCV_FISHEYE 1920 1200 1028.48726042 1030.28361972 949.47626443 597.27430166 -0.0438799 0.00787592 -0.00757873 0.00213502"
+
+    undistort: true
+    map_frame: "map"
+    base_frame: "base_link"
+    optical_frame: "base_optical"
+    rate_hz: 0.0
+    sync_slop: 0.05
+    publish_tf: true
+    publish_view_cam: "cam_0"
+    rig_transform_direction: "rig_to_cam"
+    temp_dir: "/tmp/ros_localizer_bero_cam02"
+    lidar_topic: "/hrz/points"
+    control_topic: "/vps/localizer_enabled"
+    debug_topic: "/vps/localizer_debug_enabled"
+    status_topic: "/vps/localizer_status"
+    start_enabled: false
+    status_timeout_sec: 2.0
+    pose_topic: "/vps/current_pose"
+    path_topic: "/vps/pred_path"
+
+/web_pose_bridge:
+  ros__parameters:
+    pose_topic: "/vps/current_pose"
+    pose_topic_type: "auto"
+    web_dir: ""
+    splat_path: "/home/park/loc_ws/src/render_loc/output/gs_sdf_omni_2/gaussian_map.splat"
+    aligned_ply: "/home/park/loc_ws/src/render_loc/output/gs_sdf_omni_2/aligned_map.ply"
+    host: "0.0.0.0"
+    port: 8081
+    trajectory_json: "/tmp/render_loc_no_trajectory.json"
+    trajectory_autoplay: false
+    test_bag_path: "/home/park/Downloads/bero_test1/ch/test/test.db3"
+    image_topic: "/cam_0/image_raw/compressed"
+    image_topics:
+      - "/cam_0/image_raw/compressed"
+      - "/cam_2/image_raw/compressed"
+    image_topic_type: "compressed"
+    camera_stream_enabled: true
+    camera_stream_hz: 4.0
+    localizer_control_topic: "/vps/localizer_enabled"
+    localizer_debug_topic: "/vps/localizer_debug_enabled"
+    localizer_status_topic: "/vps/localizer_status"
+    topdown_map_size: 1024
+    topdown_z_min: -1.0
+    topdown_z_max: 3.0
+
+/gaussian_ply_publisher:
+  ros__parameters:
+    ply_path: "output/gs_sdf_omni_2/aligned_map.ply"
+    map_frame: "map"
+    topic: "~/cloud"
+    stride: 1
+    opacity_min: 0.0
+    publish_period: 2.0

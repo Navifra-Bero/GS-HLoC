@@ -1,11 +1,16 @@
-import os, pickle
+import os, pickle, time
 import numpy as np
 import cv2
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
-from .multi_cam import parse_kapture_rigs, parse_kapture_sensors, load_multi_cam_config
+from .multi_cam import (
+    load_multi_cam_config,
+    normalize_rig_transforms,
+    parse_kapture_rigs,
+    parse_kapture_sensors,
+)
 
 
 def _load_ref_depth(ref_entry):
@@ -802,6 +807,7 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
     print("\n" + "="*60 +
           f"\nSTEP 7: 2D-3D pose estimation (PnP{line_label})"
           "\n" + "="*60)
+    t_step = time.perf_counter()
 
     fx, fy = cam["fx"], cam["fy"]
     cx, cy = cam["cx"], cam["cy"]
@@ -848,7 +854,8 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
         if not os.path.isabs(kapture_dir):
             kapture_dir = os.path.join(os.getcwd(), kapture_dir)
 
-        rigs    = parse_kapture_rigs(kapture_dir)     # {cam_id: T_rig_to_cam}
+        rigs    = normalize_rig_transforms(
+            parse_kapture_rigs(kapture_dir), config)  # {cam_id: T_rig_to_cam}
         sensors = parse_kapture_sensors(kapture_dir)  # {cam_id: {fx,fy,cx,cy,...}}
 
         print(f"  Mode: multi-cam PnP  active={active_cams}  primary={mc_primary}")
@@ -1244,7 +1251,8 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
             if not os.path.isabs(_kap_dir):
                 _kap_dir = os.path.join(os.getcwd(), _kap_dir)
             if os.path.isdir(_kap_dir):
-                _rigs = parse_kapture_rigs(_kap_dir)
+                _rigs = normalize_rig_transforms(
+                    parse_kapture_rigs(_kap_dir), config)
                 _T_rc = _rigs.get(_used_cam)
                 if _T_rc is not None:
                     # c2w_rig = c2w_cam @ T_rig_to_cam
@@ -1433,9 +1441,13 @@ def step7_pnp(step6_data, step5_data, config, output_dir, save_images=True):
         "pnp_method":        pnp_method,
         "pnp_cams_used":     pnp_cams_used,
         "best_pnp_cam":      best_pnp_cam,
+        "pnp_results":       pnp_results,
         "joint_refine_stats": joint_stats,
         "line_refine_stats": line_refine_stats,
         "pose_selection":    pose_selection,
+        "timings": {
+            "step7_pnp_line_refine_sec": time.perf_counter() - t_step,
+        },
     }
     if save_images:
         pickle.dump(result, open(os.path.join(output_dir, "step7_data.pkl"), "wb"))

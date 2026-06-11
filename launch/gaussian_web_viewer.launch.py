@@ -45,8 +45,14 @@ def generate_launch_description():
     gen_topdown = LaunchConfiguration("gen_topdown")
     topdown_z_min = LaunchConfiguration("topdown_z_min")
     topdown_z_max = LaunchConfiguration("topdown_z_max")
+    topdown_map_size = LaunchConfiguration("topdown_map_size")
+    trajectory_json = LaunchConfiguration("trajectory_json")
+    trajectory_autoplay = LaunchConfiguration("trajectory_autoplay")
+    trajectory_image_stride = LaunchConfiguration("trajectory_image_stride")
+    test_bag_path = LaunchConfiguration("test_bag_path")
     image_topic = LaunchConfiguration("image_topic")
     image_topic_type = LaunchConfiguration("image_topic_type")
+    camera_stream_enabled = LaunchConfiguration("camera_stream_enabled")
 
     return LaunchDescription([
         DeclareLaunchArgument("repo_root", default_value=repo_root_default),
@@ -69,11 +75,25 @@ def generate_launch_description():
                               description="top-down 슬라이스 하한 Z (바닥=0)"),
         DeclareLaunchArgument("topdown_z_max", default_value="3.0",
                               description="top-down 슬라이스 상한 Z (바닥+N m)"),
+        DeclareLaunchArgument("topdown_map_size", default_value="1024",
+                              description="PLY top-down 미니맵 PNG 해상도"),
+        DeclareLaunchArgument("trajectory_json", default_value="",
+                              description="미리 계산된 trajectory_poses.json (비우면 splat_path 기준 자동 탐색)"),
+        DeclareLaunchArgument("trajectory_autoplay", default_value="false",
+                              description="trajectory_json 자동 재생 여부 (false면 P 키로 시작)"),
+        DeclareLaunchArgument("trajectory_image_stride", default_value="10",
+                              description="image stamp sync 실패 시 N개 이미지마다 trajectory 1 step"),
+        DeclareLaunchArgument(
+            "test_bag_path",
+            default_value="/home/park/Downloads/bero_test1/bero_test1_bag",
+            description=", 키로 재생할 테스트 rosbag2 디렉토리 또는 .db3 파일"),
         DeclareLaunchArgument("image_topic",
                               default_value="/cam0/image_raw/compressed",
                               description="카메라 패널용 image 토픽 (빈 값이면 비활성)"),
         DeclareLaunchArgument("image_topic_type", default_value="auto",
                               description="auto | raw | compressed"),
+        DeclareLaunchArgument("camera_stream_enabled", default_value="true",
+                              description="false면 web_pose_bridge가 image topic을 구독하지 않음"),
 
         ExecuteProcess(
             condition=IfCondition(gen_splat),
@@ -110,11 +130,20 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "web_dir": web_dir,
+                "aligned_ply": aligned_ply,
                 "splat_path": splat_path,
                 "pose_topic": pose_topic,
                 "pose_topic_type": pose_topic_type,
+                "topdown_z_min": topdown_z_min,
+                "topdown_z_max": topdown_z_max,
+                "topdown_map_size": topdown_map_size,
+                "trajectory_json": trajectory_json,
+                "trajectory_autoplay": trajectory_autoplay,
+                "trajectory_image_stride": trajectory_image_stride,
+                "test_bag_path": test_bag_path,
                 "image_topic": image_topic,
                 "image_topic_type": image_topic_type,
+                "camera_stream_enabled": camera_stream_enabled,
                 "port": port,
             }],
         ),

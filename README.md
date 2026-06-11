@@ -130,3 +130,44 @@ render_loc/
 | Output | 6DoF pose | 6DoF pose | Coarse segment |
 | Training | None | None | Required |
 | Key advantage | Mature pipeline | Direct PLY use | Compressed storage |
+
+## Real-time ROS2 localization (online)
+
+검증된 오프라인 파이프라인 step5(retrieval)→step6(match)→step7(pnp)를 그대로
+재사용해, 들어오는 이미지 토픽(main/sub 2대)으로 실시간 localization을 수행하고
+추정 위치를 정렬(Z-up) 가우시안 지도 위에 rviz2로 표시한다.
+
+추가 노드/파일:
+- `scripts/ros/ros_localizer_node.py` — 이미지 토픽 → `localize_single` → pose(map frame).
+  fisheye는 `camera_info`로 원본 K 유지 undistort 후 파이프라인에 투입.
+- `scripts/ros/gaussian_ply_publisher.py` — 가우시안 PLY(center+SH DC 색) → 라치드 PointCloud2.
+- `launch/ros_localizer.launch.py`, `config/ros_localizer.yaml`, `rviz/online_localizer.rviz`.
+
+cam 매핑: 토픽↔`cam_ids`, `main_cam`/`sub_cams`는 전부 `config/ros_localizer.yaml`에서
+변경한다(기본 bag `cam0`→`cam_0`(main), `cam1`→`cam_1`(sub)).
+
+### 실행
+
+```bash
+# 환경 (torch+cuda / plyfile / rclpy 한 env)
+conda activate render_loc
+source /opt/ros/humble/setup.bash
+source install/setup.bash      # colcon build --packages-select render_loc 이후
+
+# 터미널 A: localizer + 가우시안 지도 + rviz
+ros2 launch render_loc ros_localizer.launch.py use_rviz:=true
+
+# 터미널 B: 이미지 토픽 재생 (step5~7가 GPU에서 프레임당 ~1–3s이므로 느리게)
+ros2 bag play /home/park/Downloads/bero_test1/bero_test1_bag --rate 0.15
+```
+
+토픽: `/ros_localizer/pose`(PoseStamped), `/ros_localizer/path`(Path),
+`/gaussian_ply_publisher/cloud`(PointCloud2), TF `map`→`base_optical`(→`base_link`).
+
+참고: 노드는 동기된 **최신 프레임만 처리하고 나머지는 드롭**(`rate_hz` 상한)하므로
+~0.5–1Hz로 pose를 갱신한다. 로봇/서버 분리 시 `ROS_DOMAIN_ID`만 맞추면 서버에서 그대로 동작.
+
+
+260612
+ROS 실시간 통신 완료
+Archived 
