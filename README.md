@@ -166,3 +166,8 @@ ros2 bag play /home/park/Downloads/bero_test1/bero_test1_bag --rate 0.15
 
 참고: 노드는 동기된 **최신 프레임만 처리하고 나머지는 드롭**(`rate_hz` 상한)하므로
 ~0.5–1Hz로 pose를 갱신한다. 로봇/서버 분리 시 `ROS_DOMAIN_ID`만 맞추면 서버에서 그대로 동작.
+
+
+260612
+ROS 실시간 통신 완료
+Archived 
