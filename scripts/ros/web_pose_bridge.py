@@ -197,6 +197,9 @@ class _Handler(SimpleHTTPRequestHandler):
         if path == "/localizer/stop":
             self._serve_localizer_control(False)
             return
+        if path == "/localizer/debug/toggle":
+            self._serve_localizer_debug_toggle()
+            return
         self.send_error(404, f"unknown endpoint: {path}")
 
     def do_OPTIONS(self):
@@ -284,6 +287,21 @@ class _Handler(SimpleHTTPRequestHandler):
         msg.data = bool(enabled)
         pub.publish(msg)
         self._serve_json({"ok": True, "enabled": bool(enabled)})
+
+    def _serve_localizer_debug_toggle(self):
+        pub = getattr(self.server, "localizer_debug_pub", None)
+        if pub is None:
+            self._serve_json({
+                "ok": False,
+                "error": "localizer debug publisher unavailable",
+            }, status=500)
+            return
+        enabled = not bool(getattr(self.server, "localizer_debug_enabled", False))
+        self.server.localizer_debug_enabled = enabled
+        msg = Bool()
+        msg.data = enabled
+        pub.publish(msg)
+        self._serve_json({"ok": True, "enabled": enabled})
 
     def _valid_test_bag_path(self):
         bag_path = getattr(self.server, "test_bag_path", "")
@@ -647,8 +665,10 @@ class WebPoseBridge(Node):
         self.declare_parameter("image_topic", "")  # 비우면 카메라 패널 비활성
         self.declare_parameter("image_topics", Parameter.Type.STRING_ARRAY)
         self.declare_parameter("image_topic_type", "auto")  # auto | raw | compressed
+        self.declare_parameter("camera_stream_enabled", True)
         self.declare_parameter("camera_stream_hz", 0.0)  # 0 이하 = 제한 없음
         self.declare_parameter("localizer_control_topic", "/vps/localizer_enabled")
+        self.declare_parameter("localizer_debug_topic", "/vps/localizer_debug_enabled")
         self.declare_parameter("localizer_status_topic", "/vps/localizer_status")
         self.declare_parameter("host", "0.0.0.0")
         self.declare_parameter("port", 8080)
@@ -773,8 +793,10 @@ class WebPoseBridge(Node):
                 f"(got {topic_type!r})")
 
         control_topic = self.get_parameter("localizer_control_topic").value
+        debug_topic = self.get_parameter("localizer_debug_topic").value
         status_topic = self.get_parameter("localizer_status_topic").value
         self.localizer_control_pub = self.create_publisher(Bool, control_topic, 10)
+        self.localizer_debug_pub = self.create_publisher(Bool, debug_topic, 10)
         if status_topic:
             self._subs.append(self.create_subscription(
                 String, status_topic, self._on_localizer_status, 10))
@@ -782,14 +804,20 @@ class WebPoseBridge(Node):
         # 카메라 image 토픽 → MJPEG. image_topics가 있으면 다중 패널로 서빙.
         self._image_bc = None
         self._image_bcs = []
+        stream_enabled = _coerce_bool(self.get_parameter("camera_stream_enabled").value)
         stream_hz = float(self.get_parameter("camera_stream_hz").value)
         self._camera_stream_period = 1.0 / stream_hz if stream_hz > 0.0 else 0.0
         self._camera_stream_last_t = {}
         image_topics_value = self.get_parameter("image_topics").value
-        image_topics = list(image_topics_value) if image_topics_value else []
-        fallback_image_topic = self.get_parameter("image_topic").value
-        if not image_topics and fallback_image_topic:
-            image_topics = [fallback_image_topic]
+        image_topics = []
+        if stream_enabled:
+            image_topics = list(image_topics_value) if image_topics_value else []
+            fallback_image_topic = self.get_parameter("image_topic").value
+            if not image_topics and fallback_image_topic:
+                image_topics = [fallback_image_topic]
+        else:
+            self.get_logger().info(
+                "카메라 MJPEG 구독 비활성화(camera_stream_enabled=false)")
         img_type_param = str(self.get_parameter("image_topic_type").value).lower()
         self._cv_bridge = None
         for image_idx, image_topic in enumerate(image_topics):
@@ -846,6 +874,8 @@ class WebPoseBridge(Node):
         self._httpd.test_bag_lock = threading.Lock()
         self._httpd.test_bag_proc = None
         self._httpd.localizer_control_pub = self.localizer_control_pub
+        self._httpd.localizer_debug_pub = self.localizer_debug_pub
+        self._httpd.localizer_debug_enabled = False
         self._srv_thread = threading.Thread(
             target=self._httpd.serve_forever, daemon=True)
         self._srv_thread.start()
@@ -870,7 +900,8 @@ class WebPoseBridge(Node):
         self.get_logger().info(
             f"pose 구독: {pose_topic} type={topic_type} → SSE /events")
         self.get_logger().info(
-            f"localizer 제어: {control_topic}  상태: {status_topic or '-'}")
+            f"localizer 제어: {control_topic}  debug: {debug_topic}  "
+            f"상태: {status_topic or '-'}")
 
     def _on_compressed_image(self, msg: CompressedImage, image_bc=None):
         image_bc = image_bc or self._image_bc
@@ -911,6 +942,9 @@ class WebPoseBridge(Node):
         try:
             payload = json.loads(msg.data)
             payload["type"] = "localizer_status"
+            loc = payload.get("localization") or {}
+            if hasattr(self, "_httpd"):
+                self._httpd.localizer_debug_enabled = bool(loc.get("debug_enabled", False))
             self._bc.publish(json.dumps(payload))
         except Exception:
             self._bc.publish(json.dumps({

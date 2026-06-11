@@ -23,7 +23,6 @@ import sys
 import threading
 import time
 import json
-from collections import deque
 
 import numpy as np
 import cv2
@@ -94,9 +93,12 @@ class RosLocalizerNode(Node):
         self.declare_parameter("rate_hz", 2.0)
         self.declare_parameter("sync_slop", 0.05)
         self.declare_parameter("publish_tf", True)
+        self.declare_parameter("publish_view_cam", "")
+        self.declare_parameter("rig_transform_direction", "rig_to_cam")
         self.declare_parameter("temp_dir", "/tmp/ros_localizer")
         self.declare_parameter("lidar_topic", "/hrz/points")
         self.declare_parameter("control_topic", "/vps/localizer_enabled")
+        self.declare_parameter("debug_topic", "/vps/localizer_debug_enabled")
         self.declare_parameter("status_topic", "/vps/localizer_status")
         self.declare_parameter("start_enabled", False)
         self.declare_parameter("status_timeout_sec", 2.0)
@@ -119,9 +121,12 @@ class RosLocalizerNode(Node):
         self.rate_hz = float(gp("rate_hz").value)
         self.sync_slop = float(gp("sync_slop").value)
         self.publish_tf = bool(gp("publish_tf").value)
+        self.publish_view_cam = str(gp("publish_view_cam").value or self.main_cam).strip()
+        self.rig_transform_direction = str(gp("rig_transform_direction").value).strip()
         self.temp_dir = gp("temp_dir").value
         self.lidar_topic = gp("lidar_topic").value
         self.control_topic = gp("control_topic").value
+        self.debug_topic = gp("debug_topic").value
         self.status_topic = gp("status_topic").value
         self.localization_enabled = bool(gp("start_enabled").value)
         self.status_timeout_sec = float(gp("status_timeout_sec").value)
@@ -149,7 +154,15 @@ class RosLocalizerNode(Node):
 
         from pipeline import load_config, load_pkl  # noqa: E402
         from pipeline.batch_test import localize_single  # noqa: E402
+        from pipeline.step.multi_cam import (  # noqa: E402
+            load_multi_cam_config,
+            normalize_rig_transforms,
+            parse_kapture_rigs,
+        )
         self._localize_single = localize_single
+        self._load_multi_cam_config = load_multi_cam_config
+        self._normalize_rig_transforms = normalize_rig_transforms
+        self._parse_kapture_rigs = parse_kapture_rigs
 
         cfg_path = gp("config_file").value
         if not os.path.isabs(cfg_path):
@@ -164,7 +177,22 @@ class RosLocalizerNode(Node):
         mc["sub_cams"] = self.sub_cams
         mc["cam_ids"] = self.cam_ids
         mc["primary_cam"] = self.main_cam
+        mc["rig_transform_direction"] = self.rig_transform_direction
         # kapture_dir(rig/intrinsic 소스)는 config 값 유지 (test_data_rectified)
+        self._rigs = self._load_rig_transforms()
+        self._view_T_rig_to_cam = None
+        if self.publish_view_cam.lower() not in ("", "rig", "none"):
+            self._view_T_rig_to_cam = self._rigs.get(self.publish_view_cam)
+            if self._view_T_rig_to_cam is None:
+                self.get_logger().warn(
+                    f"publish_view_cam={self.publish_view_cam!r} extrinsic을 찾지 못했습니다. "
+                    "표시 pose는 estimated rig pose를 그대로 사용합니다.")
+            else:
+                self.get_logger().info(
+                    f"표시 pose 고정 카메라: {self.publish_view_cam}")
+        else:
+            self.publish_view_cam = "rig"
+            self.get_logger().info("표시 pose: rig frame")
 
         out_dir = gp("output_dir").value
         if not os.path.isabs(out_dir):
@@ -193,13 +221,15 @@ class RosLocalizerNode(Node):
         self._frame_seq = 0
         self._cam_last_seen = {cid: None for cid in self.cam_ids}
         self._cam_last_stamp = {cid: None for cid in self.cam_ids}
-        self._cam_seen_times = {cid: deque(maxlen=200) for cid in self.cam_ids}
         self._lidar_last_seen = None
         self._lidar_last_stamp = None
-        self._lidar_seen_times = deque(maxlen=500)
-        self._localize_done_times = deque(maxlen=100)
         self._last_localize_sec = None
         self._last_localize_ok = None
+        self._last_pnp_info = {}
+        self._debug_enabled = False
+        self._debug_samples = []
+        self._debug_log_path = None
+        self._debug_started_wall = None
         self._last_status_t = 0.0
 
         # ── publishers ─────────────────────────────────────────────────────
@@ -228,17 +258,12 @@ class RosLocalizerNode(Node):
 
         # image: ApproximateTimeSynchronizer 로 동기화
         self._img_subs = []
-        self._image_status_subs = []
         for i, img_topic in enumerate(self.cam_topics):
             msg_type = (CompressedImage if img_topic.endswith("compressed")
                         else Image)
             self._img_subs.append(
                 message_filters.Subscriber(self, msg_type, img_topic,
                                            qos_profile=sensor_qos))
-            cid = self.topic_cam_id[i]
-            self._image_status_subs.append(self.create_subscription(
-                msg_type, img_topic,
-                lambda msg, c=cid: self._on_image_status(msg, c), sensor_qos))
         self._sync = message_filters.ApproximateTimeSynchronizer(
             self._img_subs, queue_size=5, slop=self.sync_slop)
         self._sync.registerCallback(self._on_synced_images)
@@ -249,6 +274,8 @@ class RosLocalizerNode(Node):
                 PointCloud2, self.lidar_topic, self._on_lidar_status, sensor_qos)
         self._control_sub = self.create_subscription(
             Bool, self.control_topic, self._on_control, 10)
+        self._debug_sub = self.create_subscription(
+            Bool, self.debug_topic, self._on_debug_control, 10)
         self._status_timer = self.create_timer(0.5, self._publish_status)
 
         # 워커 스레드 시작
@@ -265,7 +292,8 @@ class RosLocalizerNode(Node):
             f"sync_slop={self.sync_slop}s")
         self.get_logger().info(
             f"localizer control={self.control_topic} start_enabled={self.localization_enabled} "
-            f"status={self.status_topic} lidar={self.lidar_topic or '-'}")
+            f"debug={self.debug_topic} status={self.status_topic} "
+            f"lidar={self.lidar_topic or '-'}")
 
     # ── camera_info → undistort 맵 ──────────────────────────────────────────
     def _on_camera_info(self, msg: CameraInfo, cam_id: str):
@@ -332,6 +360,12 @@ class RosLocalizerNode(Node):
 
     # ── 동기 이미지 콜백: 최신 프레임만 슬롯에 보관 (드롭) ───────────────────
     def _on_synced_images(self, *msgs):
+        now = time.time()
+        for i, m in enumerate(msgs):
+            cid = self.topic_cam_id[i]
+            self._cam_last_seen[cid] = now
+            self._cam_last_stamp[cid] = m.header.stamp
+        self._publish_status()
         if not self.localization_enabled:
             return
         if not self._pose_ready_now():
@@ -346,18 +380,10 @@ class RosLocalizerNode(Node):
         with self._lock:
             self._latest = frame
 
-    def _on_image_status(self, msg, cam_id: str):
-        now = time.time()
-        self._cam_last_seen[cam_id] = now
-        self._cam_last_stamp[cam_id] = msg.header.stamp
-        self._cam_seen_times[cam_id].append(now)
-        self._publish_status()
-
     def _on_lidar_status(self, msg: PointCloud2):
         now = time.time()
         self._lidar_last_seen = now
         self._lidar_last_stamp = msg.header.stamp
-        self._lidar_seen_times.append(now)
         self._publish_status()
 
     def _on_control(self, msg: Bool):
@@ -369,16 +395,113 @@ class RosLocalizerNode(Node):
             "localization " + ("ENABLED" if self.localization_enabled else "DISABLED"))
         self._publish_status(force=True)
 
-    def _is_recent(self, t):
-        return t is not None and (time.time() - t) <= self.status_timeout_sec
+    def _on_debug_control(self, msg: Bool):
+        enabled = bool(msg.data)
+        if enabled == self._debug_enabled:
+            self._publish_status(force=True)
+            return
+        if enabled:
+            self._start_debug_session()
+        else:
+            self._stop_debug_session()
+        self._publish_status(force=True)
+
+    def _start_debug_session(self):
+        log_dir = os.path.join(self.repo_root, "log")
+        os.makedirs(log_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        self._debug_log_path = os.path.join(
+            log_dir, f"localization_step_timing_{stamp}.log")
+        self._debug_samples = []
+        self._debug_started_wall = time.time()
+        self._debug_enabled = True
+        with open(self._debug_log_path, "w", encoding="utf-8") as f:
+            f.write("# RenderLoc localization step timing debug\n")
+            f.write(f"# started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("# columns: seq total step5 step6_jamma step6_sold2 step7 "
+                    "best_cam view_cam\n")
+        self.get_logger().info(f"localization timing debug START: {self._debug_log_path}")
+
+    def _stop_debug_session(self):
+        if not self._debug_enabled:
+            return
+        summary = self._format_debug_summary()
+        if self._debug_log_path:
+            with open(self._debug_log_path, "a", encoding="utf-8") as f:
+                f.write("\n" + summary + "\n")
+        self.get_logger().info(
+            "localization timing debug STOP\n" + summary)
+        self._debug_enabled = False
 
     @staticmethod
-    def _hz_from_times(times, now, window=2.0):
-        recent = [t for t in times if now - t <= window]
-        if len(recent) < 2:
-            return 0.0
-        span = max(recent[-1] - recent[0], 1e-6)
-        return (len(recent) - 1) / span
+    def _hz(sec):
+        return 0.0 if sec <= 0.0 else 1.0 / sec
+
+    @staticmethod
+    def _fmt_speed(sec):
+        if sec is None:
+            return "-"
+        return f"{RosLocalizerNode._hz(sec):.3f} hz ({sec:.3f}s)"
+
+    def _mean_debug_value(self, key):
+        vals = [float(s[key]) for s in self._debug_samples if s.get(key) is not None]
+        if not vals:
+            return None
+        return float(sum(vals) / len(vals))
+
+    def _format_debug_summary(self):
+        n = len(self._debug_samples)
+        elapsed = 0.0 if self._debug_started_wall is None else time.time() - self._debug_started_wall
+        m = self._mean_debug_value
+        lines = [
+            "============================================================",
+            f"Localization step timing summary  samples={n}  elapsed={elapsed:.1f}s",
+            "============================================================",
+            "Step 5",
+            f"retrieval : {self._fmt_speed(m('step5_retrieval_sec'))}",
+            "-------------------------------",
+            "Step 6",
+            f"Jamma : {self._fmt_speed(m('step6_matcher_sec'))}",
+            f"SOLD2 : {self._fmt_speed(m('step6_sold2_sec'))}",
+            f"total : {self._fmt_speed(m('step6_total_sec'))}",
+            "-------------------------------",
+            "Step 7",
+            f"PnP+line refine : {self._fmt_speed(m('step7_pnp_line_refine_sec'))}",
+            "-------------------------------",
+            f"total localization : {self._fmt_speed(m('total_sec'))}",
+            f"log file : {self._debug_log_path or '-'}",
+        ]
+        return "\n".join(lines)
+
+    def _record_debug_sample(self, result, total_sec):
+        if not self._debug_enabled:
+            return
+        timings = (result or {}).get("timings", {})
+        sample = {
+            "seq": self._frame_seq,
+            "total_sec": float(total_sec),
+            "step5_retrieval_sec": timings.get("step5_retrieval_sec"),
+            "step6_matcher_sec": timings.get("step6_matcher_sec"),
+            "step6_sold2_sec": timings.get("step6_sold2_sec"),
+            "step6_total_sec": timings.get("step6_total_sec"),
+            "step7_pnp_line_refine_sec": timings.get("step7_pnp_line_refine_sec"),
+            "best_cam": self._last_pnp_info.get("best_cam"),
+            "view_cam": self._last_pnp_info.get("view_cam"),
+        }
+        self._debug_samples.append(sample)
+        if self._debug_log_path:
+            with open(self._debug_log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"seq={sample['seq']} "
+                    f"total={sample['total_sec']:.6f} "
+                    f"step5={float(sample['step5_retrieval_sec'] or 0.0):.6f} "
+                    f"jamma={float(sample['step6_matcher_sec'] or 0.0):.6f} "
+                    f"sold2={float(sample['step6_sold2_sec'] or 0.0):.6f} "
+                    f"step7={float(sample['step7_pnp_line_refine_sec'] or 0.0):.6f} "
+                    f"best_cam={sample['best_cam']} view_cam={sample['view_cam']}\n")
+
+    def _is_recent(self, t):
+        return t is not None and (time.time() - t) <= self.status_timeout_sec
 
     def _pose_ready_now(self):
         undistort_ready = (not self.do_undistort) or all(
@@ -399,7 +522,6 @@ class RosLocalizerNode(Node):
                 "seen": self._cam_last_seen[cid] is not None,
                 "recent": self._is_recent(self._cam_last_seen[cid]),
                 "age": None if self._cam_last_seen[cid] is None else now - self._cam_last_seen[cid],
-                "hz": self._hz_from_times(self._cam_seen_times[cid], now),
                 "topic": self.cam_topics[i],
             }
             for i, cid in enumerate(self.cam_ids)
@@ -410,7 +532,6 @@ class RosLocalizerNode(Node):
             "seen": self._lidar_last_seen is not None,
             "recent": (not lidar_required) or self._is_recent(self._lidar_last_seen),
             "age": None if self._lidar_last_seen is None else now - self._lidar_last_seen,
-            "hz": self._hz_from_times(self._lidar_seen_times, now),
             "topic": self.lidar_topic or "",
         }
         undistort_ready = (not self.do_undistort) or all(
@@ -428,11 +549,14 @@ class RosLocalizerNode(Node):
             "processed": self._frame_seq,
             "localization": {
                 "enabled": self.localization_enabled,
-                "hz": self._hz_from_times(self._localize_done_times, now, window=10.0),
+                "debug_enabled": self._debug_enabled,
+                "debug_log": self._debug_log_path,
+                "debug_samples": len(self._debug_samples),
                 "last_sec": self._last_localize_sec,
                 "last_ok": self._last_localize_ok,
                 "rate_limit_hz": None if self.rate_hz <= 0.0 else self.rate_hz,
                 "mode": "latest_frame_drop_queue",
+                "pnp": self._last_pnp_info,
             },
         }
         msg = String()
@@ -504,25 +628,86 @@ class RosLocalizerNode(Node):
         work_dir = os.path.join(self.temp_dir, "work")
 
         t0 = time.time()
-        est_pose = self._localize_single(
+        result = self._localize_single(
             query_images[self.main_cam], self.db, self.config, work_dir,
-            save_images=False, query_images=query_images)
+            save_images=False, query_images=query_images, return_result=True)
+        est_pose = result.get("estimated_pose") if result else None
         dt = time.time() - t0
         self._frame_seq += 1
         self._last_localize_sec = dt
         self._last_localize_ok = est_pose is not None
-        self._localize_done_times.append(time.time())
+        publish_pose, view_source = self._pose_for_publish(result, est_pose)
+        self._last_pnp_info = self._summarize_pnp_result(result)
+        self._last_pnp_info["view_cam"] = self.publish_view_cam
+        self._last_pnp_info["view_source"] = view_source
+        self._record_debug_sample(result, dt)
         self._publish_status(force=True)
 
         if est_pose is None:
             self.get_logger().info(f"[{self._frame_seq}] localize FAIL  ({dt:.2f}s)")
             return
 
-        xyz = est_pose[:3, 3]
+        xyz = publish_pose[:3, 3]
         self.get_logger().info(
             f"[{self._frame_seq}] OK  xyz=({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})  "
-            f"({dt:.2f}s)")
-        self._publish_pose(est_pose, stamp)
+            f"({dt:.2f}s) view={self.publish_view_cam}/{view_source}")
+        self._publish_pose(publish_pose, stamp)
+
+    def _load_rig_transforms(self):
+        try:
+            _, _, kapture_dir, _ = self._load_multi_cam_config(self.config)
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"rig config 로드 실패: {e}")
+            return {}
+        if not os.path.isabs(kapture_dir):
+            kapture_dir = os.path.join(self.repo_root, kapture_dir)
+        if not os.path.isdir(kapture_dir):
+            self.get_logger().warn(f"rig 디렉터리 없음: {kapture_dir}")
+            return {}
+        try:
+            rigs = self._normalize_rig_transforms(
+                self._parse_kapture_rigs(kapture_dir),
+                direction=self.rig_transform_direction)
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"rig extrinsic 파싱 실패: {e}")
+            return {}
+        self.get_logger().info(
+            "rig extrinsic loaded: " + ", ".join(sorted(rigs.keys())))
+        return rigs
+
+    def _pose_for_publish(self, result, estimated_pose):
+        if estimated_pose is None:
+            return None, "none"
+        view_cam = self.publish_view_cam
+        if view_cam.lower() in ("", "rig", "none"):
+            return estimated_pose, "rig"
+
+        if self._view_T_rig_to_cam is not None:
+            # step7의 estimated_pose는 multi-cam 최종 rig c2w로 정규화된 값이다.
+            # 어떤 카메라(cam_2 등)가 best로 선택돼도, 표시 시점은 고정
+            # 카메라(view_cam)의 c2w로 변환한다.
+            return (estimated_pose @ np.linalg.inv(self._view_T_rig_to_cam),
+                    "rig_to_view_cam")
+
+        pnp_results = result.get("pnp_results", {}) if result else {}
+        cam_result = pnp_results.get(view_cam, {})
+        direct_cam_pose = cam_result.get("T_W_cam")
+        if direct_cam_pose is not None:
+            return np.asarray(direct_cam_pose, dtype=np.float64), "direct_pnp_fallback"
+        return estimated_pose, "estimated"
+
+    @staticmethod
+    def _summarize_pnp_result(result):
+        if not result:
+            return {}
+        return {
+            "method": result.get("pnp_method"),
+            "best_cam": result.get("best_pnp_cam"),
+            "cams_used": result.get("pnp_cams_used") or [],
+            "inliers": int(result.get("inlier_count") or 0),
+            "corr": int(result.get("n_correspondences") or 0),
+            "selection": str(result.get("pose_selection") or {}),
+        }
 
     # ── pose publish: TF map→optical, PoseStamped, Path ─────────────────────
     def _publish_pose(self, c2w, stamp):
