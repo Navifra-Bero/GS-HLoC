@@ -212,6 +212,8 @@ multi_cam:
   main_cam: "cam_0" # full DB 리트리벌 수행
   sub_cams: ["cam_2"] # main 결과의 다른 yaw에서만 리트리벌. 여러 개 가능
   filter_main_by_cam: true # true = main_cam DB entry만 main retrieval 후보로 사용
+  include_camless_entries: true # true = cam_id 없는 gaussian/rendered entry를 모든 cam 후보로 허용
+  exclude_real_entries: false # true = DB 후보에서 real/real_train 이미지를 제외하고 gaussian만 사용
   position_tol: 0.05 # 같은 viewpoint 판정 허용오차 (m). pose 위치 이내면 동일 viewpoint
   match_top_k: 3 #5   #step6_match_type2에서 feature matching을 수행할 final 후보 수
   # ── 호환용 (기존 step6/7 코드가 참조) ──────────────────────────────────
