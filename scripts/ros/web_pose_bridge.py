@@ -333,16 +333,28 @@ class _Handler(SimpleHTTPRequestHandler):
             return
 
         with lock:
+            existing = getattr(self.server, "test_bag_proc", None)
+            if existing is not None and existing.poll() is None:
+                self._serve_json({
+                    "ok": True,
+                    "bag": bag_path,
+                    "pid": existing.pid,
+                    "already_running": True,
+                })
+                return
             self._stop_test_bag_locked()
             try:
                 log_path = "/tmp/render_loc_bag_play.log"
                 log_f = open(log_path, "ab", buffering=0)
                 log_f.write(
                     f"\n--- ros2 bag play {bag_path} ---\n".encode("utf-8"))
+                env = os.environ.copy()
+                env.setdefault("ROS_LOG_DIR", "/tmp")
                 proc = subprocess.Popen(
                     ["ros2", "bag", "play", bag_path],
                     stdout=log_f,
                     stderr=log_f,
+                    env=env,
                     start_new_session=True,
                 )
             except Exception as e:  # noqa: BLE001
