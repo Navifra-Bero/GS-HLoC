@@ -1,4 +1,6 @@
-<img width="80%" alt="RenderLoc overview" src="https://github.com/user-attachments/assets/bd38e3ce-e19e-44b2-a509-460ae281f4c5" />
+<p align="center">
+  <img width="80%" alt="RenderLoc overview" src="https://github.com/user-attachments/assets/bd38e3ce-e19e-44b2-a509-460ae281f4c5" />
+</p>
 
 # RenderLoc
 
@@ -197,4 +199,3 @@ http://localhost:8081
 - 현재 live pose 토픽은 `/vps/current_pose`입니다.
 - 현재 path 토픽은 `/vps/pred_path`입니다.
 - 현재 test bag 경로는 `config/ros_localizer_bero_cam02.yaml`에서 설정합니다.
-- 큰 데이터, output, model checkpoint, third-party dependency는 코드 정리 대상에서 의도적으로 제외했습니다.
