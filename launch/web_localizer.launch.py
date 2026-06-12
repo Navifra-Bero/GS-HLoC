@@ -26,7 +26,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     pkg_share = get_package_share_directory("render_loc")
-    default_params = os.path.join(pkg_share, "config", "ros_localizer_bero_cam02.yaml")
+    default_params = os.path.join(pkg_share, "config", "ros_localizer.yaml")
     # 소스 트리 web/ (splat 31MB 는 소스 web/ 에 둔다)
     repo_root_default = "/home/park/loc_ws/src/render_loc"
 

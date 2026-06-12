@@ -168,7 +168,7 @@ http://localhost:8081
 주요 config 파일은 두 개입니다. 각 항목은 접어서 볼 수 있게 정리했습니다.
 
 <details>
-<summary><code>config/ros_localizer_bero_cam02.yaml</code> - ROS 토픽, 실시간 로컬라이저, 웹 뷰어 설정</summary>
+<summary><code>config/ros_localizer.yaml</code> - ROS 토픽, 실시간 로컬라이저, 웹 뷰어 설정</summary>
 
 - `output_dir`: localization DB/output root입니다. 현재 기본값은 `output/gs_sdf_omni_2`입니다.
 - `config_file`: ROS 노드가 로드하는 step0~7 파이프라인 설정 파일입니다.
@@ -223,7 +223,7 @@ http://localhost:8081
 - `launch/web_localizer.launch.py`: 실시간 localizer + 웹 뷰어 실행
 - `launch/gaussian_web_viewer.launch.py`: pose topic 뷰어만 실행
 - `config/render_loc_multi_cam.yaml`: 파이프라인 설정 파일
-- `config/ros_localizer_bero_cam02.yaml`: 현재 ROS/web localizer 설정 파일
+- `config/ros_localizer.yaml`: 현재 ROS/web localizer 설정 파일
 - `web/`: 브라우저 뷰어
 
 ## 오프라인 localzation 테스트 예시
@@ -259,4 +259,4 @@ http://localhost:8081
 
 - 현재 live pose 토픽은 `/vps/current_pose`입니다.
 - 현재 path 토픽은 `/vps/pred_path`입니다.
-- 현재 test bag 경로는 `config/ros_localizer_bero_cam02.yaml`에서 설정합니다.
+- 현재 test bag 경로는 `config/ros_localizer.yaml`에서 설정합니다.

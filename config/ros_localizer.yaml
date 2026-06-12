@@ -42,7 +42,7 @@
     publish_tf: true
     publish_view_cam: "cam_0"
     rig_transform_direction: "rig_to_cam"
-    temp_dir: "/tmp/ros_localizer_bero_cam02"
+    temp_dir: "/tmp/ros_localizer"
     lidar_topic: "/hrz/points"
     control_topic: "/vps/localizer_enabled"
     debug_topic: "/vps/localizer_debug_enabled"
