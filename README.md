@@ -1,8 +1,16 @@
-<img width="80%" alt="RenderLoc overview" src="https://github.com/user-attachments/assets/bd38e3ce-e19e-44b2-a509-460ae281f4c5" />
-
 # RenderLoc
 
 Gaussian/PLY map 기반 visual localization 파이프라인과 ROS2 웹 뷰어.
+
+<p align="center">
+  <img width="80%" alt="RenderLoc overview" src="https://github.com/user-attachments/assets/bd38e3ce-e19e-44b2-a509-460ae281f4c5" />
+</p>
+
+## Pipeline
+
+<p align="center">
+  <img width="1657" height="911" alt="Image" src="https://github.com/user-attachments/assets/edb0745f-a403-40d2-9a13-e6426526af4d" />
+</p>
 
 ## 현재 흐름
 
@@ -43,10 +51,7 @@ Gaussian/PLY map 기반 visual localization 파이프라인과 ROS2 웹 뷰어.
 - `third_party/MixVPR`
 - `third_party/JamMa`
 - `third_party/JamMa/weights/jamma.ckpt` 또는 최초 실행 시 JamMa weight 다운로드 가능한 네트워크
-- `output/gs_sdf_omni_2/step4_database.pkl`
-- `output/gs_sdf_omni_2/aligned_map.ply`
-- `output/gs_sdf_omni_2/gaussian_map.splat`
-- `test_rectified/cameras.txt`, `test_rectified/rigs.txt`
+- `test_rectified/cameras.txt`, `test_rectified/rigs.txt` 이는 테스트용 데이터로 camera intrinsic과 camera간의 extrinsic입니다.
 
 ## 설치 방법
 
@@ -77,13 +82,71 @@ mamba activate render_loc
 
 RTX 50xx GPU가 아니라면 `setup_env.sh`의 `CUDA_ARCHES`를 먼저 수정하세요. 현재 기본값은 Blackwell용 `12.0`입니다.
 
-ROS2 패키지를 빌드합니다:
+
+## 실행 방법
+우선 Map과 DB를 필요로 합니다.
+
+Map은 Colmap SFM/OmniLIVO를 이용해 각 이미지들의 pose와 pointcloud 정보를 가지고 사용합니다.
+
+이번 레포에서는 GS-SDF를 이용해서 가우시안 맵을 생성했습니다. 
+
+https://github.com/hku-mars/GS-SDF.git
+
+해당 방식을 이용해 학습 폴더가 하나 나왔다면 아래의 경로로 폴더를 옮긴다
+```bash
+output/gs_sdf_omni/gs_sdf_result/gs_sdf_scene1 #폴더 이름은 마음대로
+```
+
+이후 step0~4과정을 통해 DB를 생성합니다
+
+```bash
+#0 Map Align
+python3 scripts/main.py \
+  --ply_map output/gs_sdf_omni/gs_sdf_result/gs_sdf_scene1/model/gs.ply  \
+  --config config/render_loc_multi_cam.yaml \
+  --output_dir output/gs_sdf_omni \
+  --step 0_align
+  
+#1 Viewpoints
+python3 scripts/main.py \
+  --ply_map output/gs_sdf_omni/gs_sdf_result/gs_sdf_scene1/model/gs.ply \
+  --config config/render_loc_multi_cam.yaml \
+  --output_dir output/gs_sdf_omni \
+  --step 1_viewpoints
+  
+#2 Render
+python3 scripts/main.py \
+  --ply_map output/gs_sdf_omni/gs_sdf_result/gs_sdf_scene1/model/gs.ply \
+  --config config/render_loc_multi_cam.yaml \
+  --output_dir output/gs_sdf_omni \
+  --step 2_render \
+  --render_mode gaussian_ply
+
+#3 Global desc
+# 리트리벌에 사용할 수 있게 descriptor로 저장한다. 이떄 모델은 MixVPR을 사용한다.
+# 이때 step2에서 렌더링 된 이미지 뿐만 아니라, 가우시안 맵을 만들 떄 사용했던 이미지들도 같이 저장한다.
+python3 scripts/main.py \
+	--config config/render_loc_multi_cam.yaml \
+	--ply_map output/gs_sdf_omni/gs_sdf_result/gs_sdf_scene2/result/result_gs.ply \
+	--output_dir output/gs_sdf_omni \
+	--step 3_global_desc
+	
+#4 build db
+python3 scripts/main.py \
+	--config config/render_loc_multi_cam.yaml \
+	--ply_map output/gs_sdf_omni/gs_sdf_result/gs_sdf_scene2/result/result_gs.ply \
+	--output_dir output/gs_sdf_omni \
+	--step 4_build_db
+```
+
+DB가 생성이 되었다면 실시간 localization을 위해 ROS2 패키지를 빌드합니다:
 
 ```bash
 cd ~/loc_ws
 source /opt/ros/humble/setup.zsh
 colcon build --packages-select render_loc
-source install/setup.zsh
+source install/setup.zsh 
+# or source install/render_loc/share/render_loc/local_setup.zsh
 ```
 
 실시간 웹 로컬라이저를 실행합니다:
@@ -163,7 +226,7 @@ http://localhost:8081
 - `config/ros_localizer_bero_cam02.yaml`: 현재 ROS/web localizer 설정 파일
 - `web/`: 브라우저 뷰어
 
-## 오프라인 예시
+## 오프라인 localzation 테스트 예시
 
 ```bash
 python3 scripts/main.py \
@@ -197,4 +260,3 @@ http://localhost:8081
 - 현재 live pose 토픽은 `/vps/current_pose`입니다.
 - 현재 path 토픽은 `/vps/pred_path`입니다.
 - 현재 test bag 경로는 `config/ros_localizer_bero_cam02.yaml`에서 설정합니다.
-- 큰 데이터, output, model checkpoint, third-party dependency는 코드 정리 대상에서 의도적으로 제외했습니다.
