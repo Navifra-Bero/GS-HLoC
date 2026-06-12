@@ -77,12 +77,3 @@
     topdown_map_size: 1024
     topdown_z_min: -1.0
     topdown_z_max: 3.0
-
-/gaussian_ply_publisher:
-  ros__parameters:
-    ply_path: "output/gs_sdf_omni_2/aligned_map.ply"
-    map_frame: "map"
-    topic: "~/cloud"
-    stride: 1
-    opacity_min: 0.0
-    publish_period: 2.0
